@@ -1,0 +1,86 @@
+plugins {
+    id 'java'
+    id 'maven-publish'
+    id 'signing'
+}
+
+group = 'net.swofty'
+version = System.getenv('VERSION') ?: '1.0-SNAPSHOT'
+
+java {
+    withSourcesJar()
+    withJavadocJar()
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'com.google.code.gson:gson:2.11.0'
+    compileOnly 'redis.clients:jedis:5.2.0'
+
+    testImplementation platform('org.junit:junit-bom:5.10.0')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testImplementation 'redis.clients:jedis:5.2.0'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+test {
+    useJUnitPlatform()
+}
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            from components.java
+            groupId = 'net.swofty'
+            artifactId = 'SwoftyDataHandler'
+
+            pom {
+                name = 'SwoftyDataHandler'
+                description = 'A reactive, type-safe data management library for Java applications'
+                url = 'https://github.com/Swofty-Developments/SwoftyDataHandler'
+                licenses {
+                    license {
+                        name = 'The Apache License, Version 2.0'
+                        url = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
+                    }
+                }
+                developers {
+                    developer {
+                        id = 'swofty'
+                        name = 'Swofty'
+                        url = 'https://github.com/Swofty-Developments'
+                    }
+                }
+                scm {
+                    connection = 'scm:git:git://github.com/Swofty-Developments/SwoftyDataHandler.git'
+                    developerConnection = 'scm:git:ssh://github.com/Swofty-Developments/SwoftyDataHandler.git'
+                    url = 'https://github.com/Swofty-Developments/SwoftyDataHandler'
+                }
+            }
+        }
+    }
+    repositories {
+        maven {
+            name = 'OSSRH'
+            def releasesUrl = uri('https://s01.oss.sonatype.org/service/local/staging/deploy/maven2/')
+            def snapshotsUrl = uri('https://s01.oss.sonatype.org/content/repositories/snapshots/')
+            url = version.toString().endsWith('SNAPSHOT') ? snapshotsUrl : releasesUrl
+            credentials {
+                username = System.getenv('OSSRH_USERNAME') ?: ''
+                password = System.getenv('OSSRH_PASSWORD') ?: ''
+            }
+        }
+    }
+}
+
+signing {
+    def signingKey = System.getenv('GPG_SIGNING_KEY')
+    def signingPassword = System.getenv('GPG_SIGNING_PASSWORD')
+    if (signingKey && signingPassword) {
+        useInMemoryPgpKeys(signingKey, signingPassword)
+        sign publishing.publications.mavenJava
+    }
+}
