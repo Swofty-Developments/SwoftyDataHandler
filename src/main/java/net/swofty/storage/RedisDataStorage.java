@@ -70,11 +70,6 @@ public class RedisDataStorage implements DataStorage {
         }
     }
 
-    @Override
-    public boolean supportsListeners() {
-        return true;
-    }
-
     public JedisPool getPool() {
         return pool;
     }

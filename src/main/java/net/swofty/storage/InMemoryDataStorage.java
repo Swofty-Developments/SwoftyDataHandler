@@ -37,8 +37,4 @@ public class InMemoryDataStorage implements DataStorage {
         return bucket != null && bucket.containsKey(id);
     }
 
-    @Override
-    public boolean supportsListeners() {
-        return true;
-    }
 }

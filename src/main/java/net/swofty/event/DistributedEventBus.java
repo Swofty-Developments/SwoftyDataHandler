@@ -11,12 +11,8 @@ import net.swofty.codec.Codec;
 import net.swofty.data.DataReader;
 import net.swofty.data.DataWriter;
 import net.swofty.data.format.JsonFormat;
-import redis.clients.jedis.Jedis;
-import redis.clients.jedis.JedisPool;
-import redis.clients.jedis.JedisPubSub;
 
 import java.lang.reflect.Type;
-import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -24,35 +20,53 @@ public class DistributedEventBus extends EventBus {
     private static final Gson GSON = new GsonBuilder().create();
     private static final Type MAP_TYPE = new TypeToken<Map<String, Object>>() {}.getType();
 
-    private final JedisPool pool;
-    private final String channel;
+    private final PubSubHandler pubSubHandler;
     private final String nodeId;
     private final JsonFormat serializationFormat = new JsonFormat();
 
     private final ConcurrentHashMap<String, DataField<?>> fieldRegistry = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, LinkType<?>> linkTypeRegistry = new ConcurrentHashMap<>();
 
-    private Thread subscriberThread;
-    private volatile JedisPubSub activeSub;
-    private volatile boolean running = true;
-
-    public DistributedEventBus(JedisPool pool) {
-        this(pool, "swofty:events", UUID.randomUUID().toString());
+    public DistributedEventBus(PubSubHandler pubSubHandler) {
+        this(pubSubHandler, UUID.randomUUID().toString());
     }
 
-    public DistributedEventBus(JedisPool pool, String channel, String nodeId) {
-        this.pool = pool;
-        this.channel = channel;
+    public DistributedEventBus(PubSubHandler pubSubHandler, String nodeId) {
+        this.pubSubHandler = pubSubHandler;
         this.nodeId = nodeId;
-        startSubscriber();
+        pubSubHandler.subscribe(this::handleMessage);
     }
 
-    public void registerField(DataField<?> field) {
+    // ==================== Auto-register fields on subscribe ====================
+
+    @Override
+    public <T> void subscribe(DataField<T> field, PlayerDataListener<T> listener) {
         fieldRegistry.put(field.fullKey(), field);
+        super.subscribe(field, listener);
     }
 
-    public void registerLinkType(LinkType<?> type) {
+    @Override
+    public <K, T> void subscribeLinked(DataField<T> field, LinkedDataListener<K, T> listener) {
+        fieldRegistry.put(field.fullKey(), field);
+        super.subscribeLinked(field, listener);
+    }
+
+    @Override
+    public <K> void subscribeLinkChange(LinkType<K> type, LinkChangeListener<K> listener) {
         linkTypeRegistry.put(type.name(), type);
+        super.subscribeLinkChange(type, listener);
+    }
+
+    @Override
+    public <T> void subscribeExpiration(ExpiringField<T> field, ExpirationListener<T> listener) {
+        fieldRegistry.put(field.fullKey(), field);
+        super.subscribeExpiration(field, listener);
+    }
+
+    @Override
+    public <K, T> void subscribeLinkedExpiration(ExpiringLinkedField<K, T> field, LinkedExpirationListener<K, T> listener) {
+        fieldRegistry.put(field.fullKey(), field);
+        super.subscribeLinkedExpiration(field, listener);
     }
 
     // ==================== Override fire* to publish ====================
@@ -118,31 +132,7 @@ public class DistributedEventBus extends EventBus {
     // ==================== Pub/Sub ====================
 
     private void publish(EventMessage message) {
-        try (Jedis jedis = pool.getResource()) {
-            jedis.publish(channel, GSON.toJson(message));
-        }
-    }
-
-    private void startSubscriber() {
-        subscriberThread = new Thread(() -> {
-            while (running) {
-                try (Jedis jedis = pool.getResource()) {
-                    activeSub = new JedisPubSub() {
-                        @Override
-                        public void onMessage(String ch, String msg) {
-                            handleMessage(msg);
-                        }
-                    };
-                    jedis.subscribe(activeSub, channel);
-                } catch (Exception e) {
-                    if (running) {
-                        try { Thread.sleep(1000); } catch (InterruptedException ie) { break; }
-                    }
-                }
-            }
-        }, "swofty-pubsub-subscriber");
-        subscriberThread.setDaemon(true);
-        subscriberThread.start();
+        pubSubHandler.publish(GSON.toJson(message));
     }
 
     @SuppressWarnings("unchecked")
@@ -263,12 +253,6 @@ public class DistributedEventBus extends EventBus {
     // ==================== Lifecycle ====================
 
     public void shutdown() {
-        running = false;
-        if (activeSub != null) {
-            try { activeSub.unsubscribe(); } catch (Exception ignored) {}
-        }
-        if (subscriberThread != null) {
-            subscriberThread.interrupt();
-        }
+        pubSubHandler.shutdown();
     }
 }

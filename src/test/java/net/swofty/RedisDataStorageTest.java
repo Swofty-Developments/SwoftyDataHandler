@@ -114,10 +114,6 @@ class RedisDataStorageTest {
         assertArrayEquals(new byte[]{2}, storage.load("players", "a"));
     }
 
-    @Test
-    void supportsListenersReturnsTrue() {
-        assertTrue(storage.supportsListeners());
-    }
 
     @Test
     void deleteRemovesFromIndex() {

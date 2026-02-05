@@ -5,7 +5,6 @@ import net.swofty.data.DataFormat;
 import net.swofty.data.format.JsonFormat;
 import net.swofty.event.*;
 import net.swofty.storage.DataStorage;
-import net.swofty.storage.RedisDataStorage;
 import net.swofty.transaction.TransactionConsumer;
 import net.swofty.transaction.TransactionFunction;
 
@@ -24,9 +23,9 @@ public class DataAPIImpl implements DataAPI {
     private final EventBus eventBus;
     private final BulkOperationExecutor bulkOperations;
 
-    public DataAPIImpl(DataStorage storage, DataFormat format) {
+    public DataAPIImpl(DataStorage storage, DataFormat format, PubSubHandler pubSub) {
         this.storage = storage;
-        this.eventBus = createEventBus(storage);
+        this.eventBus = (pubSub != null) ? new DistributedEventBus(pubSub) : new EventBus();
         this.linkRegistry = new LinkRegistryImpl();
         this.playerData = new PlayerDataManager(storage, format, eventBus);
         this.linkedData = new LinkedDataManager(storage, format, eventBus, linkRegistry);
@@ -35,23 +34,16 @@ public class DataAPIImpl implements DataAPI {
         this.bulkOperations = new BulkOperationExecutor(playerData, linkedData, storage, eventBus);
     }
 
+    public DataAPIImpl(DataStorage storage, DataFormat format) {
+        this(storage, format, null);
+    }
+
     public DataAPIImpl(DataStorage storage) {
-        this(storage, new JsonFormat());
+        this(storage, new JsonFormat(), null);
     }
 
-    private static EventBus createEventBus(DataStorage storage) {
-        if (storage instanceof RedisDataStorage redisStorage) {
-            return new DistributedEventBus(redisStorage.getPool());
-        }
-        return new EventBus();
-    }
-
-    private void requireListenerSupport() {
-        if (!storage.supportsListeners()) {
-            throw new UnsupportedOperationException(
-                    "Event listeners are not supported with " + storage.getClass().getSimpleName()
-                            + ". Use a storage backend that supports listeners (e.g. RedisDataStorage).");
-        }
+    public DataAPIImpl(DataStorage storage, PubSubHandler pubSub) {
+        this(storage, new JsonFormat(), pubSub);
     }
 
     // ==================== Player Fields ====================
@@ -205,46 +197,26 @@ public class DataAPIImpl implements DataAPI {
 
     @Override
     public <T> void subscribe(PlayerField<T> field, PlayerDataListener<T> listener) {
-        requireListenerSupport();
-        if (eventBus instanceof DistributedEventBus deb) {
-            deb.registerField(field);
-        }
         eventBus.subscribe(field, listener);
     }
 
     @Override
     public <K, T> void subscribe(LinkedField<K, T> field, LinkedDataListener<K, T> listener) {
-        requireListenerSupport();
-        if (eventBus instanceof DistributedEventBus deb) {
-            deb.registerField(field);
-        }
         eventBus.subscribeLinked(field, listener);
     }
 
     @Override
     public <K> void subscribe(LinkType<K> type, LinkChangeListener<K> listener) {
-        requireListenerSupport();
-        if (eventBus instanceof DistributedEventBus deb) {
-            deb.registerLinkType(type);
-        }
         eventBus.subscribeLinkChange(type, listener);
     }
 
     @Override
     public <T> void subscribeExpiration(ExpiringField<T> field, ExpirationListener<T> listener) {
-        requireListenerSupport();
-        if (eventBus instanceof DistributedEventBus deb) {
-            deb.registerField(field);
-        }
         eventBus.subscribeExpiration(field, listener);
     }
 
     @Override
     public <K, T> void subscribeExpiration(ExpiringLinkedField<K, T> field, LinkedExpirationListener<K, T> listener) {
-        requireListenerSupport();
-        if (eventBus instanceof DistributedEventBus deb) {
-            deb.registerField(field);
-        }
         eventBus.subscribeLinkedExpiration(field, listener);
     }
 

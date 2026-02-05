@@ -12,6 +12,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -44,37 +45,48 @@ class FileDataStorageListenerTest {
     }
 
     @Test
-    void subscribePlayerFieldThrows() {
-        assertThrows(UnsupportedOperationException.class, () ->
-                api.subscribe(COINS, (p, old, nw) -> {}));
+    void subscribePlayerFieldWorks() {
+        AtomicBoolean fired = new AtomicBoolean(false);
+        api.subscribe(COINS, (p, old, nw) -> fired.set(true));
+        UUID player = UUID.randomUUID();
+        api.set(player, COINS, 100);
+        assertTrue(fired.get());
     }
 
     @Test
-    void subscribeLinkedFieldThrows() {
-        assertThrows(UnsupportedOperationException.class, () ->
-                api.subscribe(ISLAND_LEVEL, (key, old, nw, affected) -> {}));
+    void subscribeLinkedFieldWorks() {
+        AtomicBoolean fired = new AtomicBoolean(false);
+        api.subscribe(ISLAND_LEVEL, (key, old, nw, affected) -> fired.set(true));
+        UUID player = UUID.randomUUID();
+        UUID islandId = UUID.randomUUID();
+        api.link(player, ISLAND, islandId);
+        api.set(player, ISLAND_LEVEL, 5);
+        assertTrue(fired.get());
     }
 
     @Test
-    void subscribeLinkTypeThrows() {
-        assertThrows(UnsupportedOperationException.class, () ->
-                api.subscribe(ISLAND, new LinkChangeListener<>() {
-                    @Override
-                    public void onLinked(UUID p, LinkType<UUID> type, UUID key) {}
-                    @Override
-                    public void onUnlinked(UUID p, LinkType<UUID> type, UUID previousKey) {}
-                }));
+    void subscribeLinkTypeWorks() {
+        AtomicBoolean fired = new AtomicBoolean(false);
+        api.subscribe(ISLAND, new LinkChangeListener<>() {
+            @Override
+            public void onLinked(UUID p, LinkType<UUID> type, UUID key) { fired.set(true); }
+            @Override
+            public void onUnlinked(UUID p, LinkType<UUID> type, UUID previousKey) {}
+        });
+        UUID player = UUID.randomUUID();
+        api.link(player, ISLAND, UUID.randomUUID());
+        assertTrue(fired.get());
     }
 
     @Test
-    void subscribeExpirationThrows() {
-        assertThrows(UnsupportedOperationException.class, () ->
+    void subscribeExpirationDoesNotThrow() {
+        assertDoesNotThrow(() ->
                 api.subscribeExpiration(BOOST, (playerId, field, expiredValue) -> {}));
     }
 
     @Test
-    void subscribeLinkedExpirationThrows() {
-        assertThrows(UnsupportedOperationException.class, () ->
+    void subscribeLinkedExpirationDoesNotThrow() {
+        assertDoesNotThrow(() ->
                 api.subscribeExpiration(ISLAND_BOOST, (linkKey, field, expiredValue, memberIds) -> {}));
     }
 
