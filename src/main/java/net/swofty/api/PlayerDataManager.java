@@ -64,16 +64,25 @@ public class PlayerDataManager {
     <T> T getFieldValue(UUID player, DataField<T> field) {
         DataContainer container = getContainer(player);
         if (!container.has(field.fullKey())) {
-            byte[] raw = storage.load("players", player.toString());
-            container.loadField(field, format, raw);
+            ensureDocumentLoaded(player, container);
+            container.ensureField(field, format);
         }
         return container.get(field);
     }
 
     <T> void setFieldValue(UUID player, DataField<T> field, T value) {
         DataContainer container = getContainer(player);
+        // Warm the backing document first so serialize() merges over it and never
+        // drops fields that were never read this session.
+        ensureDocumentLoaded(player, container);
         container.set(field, value);
         persist(player);
+    }
+
+    private void ensureDocumentLoaded(UUID player, DataContainer container) {
+        if (!container.isDocumentLoaded()) {
+            container.loadDocument(format, storage.load("players", player.toString()));
+        }
     }
 
     void persist(UUID player) {
@@ -81,6 +90,7 @@ public class PlayerDataManager {
         if (container != null) {
             byte[] bytes = container.serialize(format);
             storage.save("players", player.toString(), bytes);
+            container.markPersisted(bytes);
         }
     }
 

@@ -107,8 +107,8 @@ public class LinkedDataManager {
         String ck = compositeKey(linkTypeName, key);
         DataContainer container = getContainer(ck);
         if (!container.has(field.fullKey())) {
-            byte[] raw = storage.load("linked/" + linkTypeName, key.toString());
-            container.loadField(field, format, raw);
+            ensureDocumentLoaded(linkTypeName, key, container);
+            container.ensureField(field, format);
         }
         return container.get(field);
     }
@@ -116,9 +116,17 @@ public class LinkedDataManager {
     <T> void setFieldValue(String linkTypeName, Object key, DataField<T> field, T value) {
         String ck = compositeKey(linkTypeName, key);
         DataContainer container = getContainer(ck);
+        ensureDocumentLoaded(linkTypeName, key, container);
         container.set(field, value);
         byte[] bytes = container.serialize(format);
         storage.save("linked/" + linkTypeName, key.toString(), bytes);
+        container.markPersisted(bytes);
+    }
+
+    private void ensureDocumentLoaded(String linkTypeName, Object key, DataContainer container) {
+        if (!container.isDocumentLoaded()) {
+            container.loadDocument(format, storage.load("linked/" + linkTypeName, key.toString()));
+        }
     }
 
     public List<String> listLinkedIds(String linkTypeName) {
