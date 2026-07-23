@@ -367,12 +367,95 @@ new BinaryFormat() // compact, good for production
 
 Both implement `DataFormat` and can be used with any storage backend.
 
+## Multi-Server Lifecycle
+
+Across a fleet of servers a player (or a shared entity such as an island) is authoritative on
+exactly one node at a time. The lifecycle API lets a node warm that data into its cache before
+use and evict it afterwards, so a later visit to any node is never served a stale value.
+
+```java
+// Warm a player's whole document into this node in a single storage read.
+api.load(player);                       // synchronous
+api.loadAsync(player, executor);        // CompletableFuture<Void>
+api.isLoaded(player);                   // boolean
+
+// Persist pending changes and drop the player from this node's cache.
+api.unload(player);                     // flush + evict
+api.flush(player);                      // flush without evicting
+
+// Shared/linked entities have the same lifecycle.
+api.loadLink(ISLAND, islandId);
+api.unloadLink(ISLAND, islandId);
+```
+
+This is the primitive a proxy uses to implement "load the player's data on the target server
+*before* moving them there": the proxy asks the destination to `load(player)`, waits for the
+ack, then connects the player. Because the origin calls `unload(player)` on disconnect, the
+destination always starts from fresh storage.
+
+**Deferred persistence.** By default every write is flushed immediately. Pass `autoPersist = false`
+to buffer a whole play session in the cache and write it back once, on `flush`/`unload`
+(`shutdown` flushes everything so nothing is lost):
+
+```java
+DataAPI api = new DataAPIImpl(storage, new JsonFormat(), pubSub, /* autoPersist */ false);
+```
+
+**Cache coherency.** With a distributed event bus, a change made on another node to an entity that
+is currently loaded here updates the local view in place, so subscribed fields never go stale
+while a player is online. Eviction on `unload` handles the general case.
+
+## Distributed Locking
+
+Transactions guard a JVM-local lock by default, which only serialises threads within one process.
+Supply a `DistributedLock` to get true cross-node mutual exclusion — required when the same shared
+entity can be mutated from more than one server (e.g. a coop bank):
+
+```java
+DistributedLock lock = new RedisDistributedLock(jedisPool);   // or InMemoryDistributedLock for one node
+DataAPI api = new DataAPIImpl(storage, new JsonFormat(), pubSub, true, lock);
+
+// Transactions now take a cross-node lock keyed by the entity, in addition to the local monitor.
+api.transactionDirect(coopId, COOP, tx -> { tx.update(BANK, b -> b - 1000L); return null; });
+
+// The same primitive is available for app-level critical sections:
+try (var handle = ((DataAPIImpl) api).lock("coop-transfer:" + coopId, Duration.ofSeconds(5))) {
+    // ... multi-entity critical section ...
+}
+```
+
+The Redis implementation uses `SET NX PX` with a compare-and-delete release, so a lock is only
+released by its owner and a lease bounds a crashed holder.
+
+## Indexed Leaderboards
+
+Leaderboards are index-backed and **self-registering — no setup for numeric fields**. The first time
+you rank a field its index is built from existing data in one scan; from then on every node maintains
+it on write, and ranking reads only the requested slice. This requires a `LeaderboardIndex`-capable
+storage (`RedisDataStorage`, backed by sorted sets, or `InMemoryDataStorage` for single-node/tests):
+
+```java
+api.getTop(COINS, 10);         // just works — O(log N + page), no registration
+api.getTopPaged(COINS, 1, 50);
+```
+
+Only a **non-numeric** field needs a score function, since a sorted set ranks by a number:
+
+```java
+api.trackLeaderboard(NAME, String::length); // rank players by name length
+```
+
+`rebuildLeaderboard(field)` forces a rebuild from stored data if you ever need it. Storage backends
+that don't maintain an index (e.g. `FileDataStorage`) throw on ranking rather than silently scanning;
+`getTop(field, limit, comparator)` remains as the explicit scan-based escape hatch for ad-hoc custom
+orderings.
+
 ## Lifecycle
 
 Always shut down the API when done:
 
 ```java
-api.shutdown(); // stops expiration timers, closes Pub/Sub subscribers
+api.shutdown(); // flushes deferred writes, stops expiration timers, closes Pub/Sub subscribers
 ```
 
 For Redis storage, also close the storage:

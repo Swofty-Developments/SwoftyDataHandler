@@ -39,4 +39,18 @@ public class JsonFormat implements DataFormat {
         String json = GSON.toJson(jsonWriter.getData());
         return json.getBytes(StandardCharsets.UTF_8);
     }
+
+    @Override
+    public Map<String, Object> readRaw(byte[] data) {
+        if (data == null || data.length == 0) {
+            return new LinkedHashMap<>();
+        }
+        Map<String, Object> map = GSON.fromJson(new String(data, StandardCharsets.UTF_8), MAP_TYPE);
+        return map == null ? new LinkedHashMap<>() : map;
+    }
+
+    @Override
+    public byte[] writeRaw(Map<String, Object> data) {
+        return GSON.toJson(data).getBytes(StandardCharsets.UTF_8);
+    }
 }

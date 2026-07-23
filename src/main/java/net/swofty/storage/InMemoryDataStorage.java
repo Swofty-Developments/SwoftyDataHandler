@@ -3,8 +3,9 @@ package net.swofty.storage;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
-public class InMemoryDataStorage implements DataStorage {
+public class InMemoryDataStorage implements DataStorage, LeaderboardIndex {
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, byte[]>> data = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, ConcurrentHashMap<String, Double>> leaderboards = new ConcurrentHashMap<>();
 
     @Override
     public byte[] load(String type, String id) {
@@ -37,4 +38,56 @@ public class InMemoryDataStorage implements DataStorage {
         return bucket != null && bucket.containsKey(id);
     }
 
+    // ---- LeaderboardIndex ---------------------------------------------------
+
+    @Override
+    public void updateScore(String leaderboard, String id, double score) {
+        leaderboards.computeIfAbsent(leaderboard, k -> new ConcurrentHashMap<>()).put(id, score);
+    }
+
+    @Override
+    public void updateScoreIfPresent(String leaderboard, String id, double score) {
+        ConcurrentHashMap<String, Double> board = leaderboards.get(leaderboard);
+        if (board != null) {
+            board.put(id, score);
+        }
+    }
+
+    @Override
+    public boolean leaderboardExists(String leaderboard) {
+        ConcurrentHashMap<String, Double> board = leaderboards.get(leaderboard);
+        return board != null && !board.isEmpty();
+    }
+
+    @Override
+    public void removeFromLeaderboard(String leaderboard, String id) {
+        ConcurrentHashMap<String, Double> board = leaderboards.get(leaderboard);
+        if (board != null) {
+            board.remove(id);
+        }
+    }
+
+    @Override
+    public List<ScoreEntry> scoreRange(String leaderboard, int start, int endInclusive, boolean descending) {
+        ConcurrentHashMap<String, Double> board = leaderboards.get(leaderboard);
+        if (board == null) {
+            return List.of();
+        }
+        List<ScoreEntry> sorted = new ArrayList<>();
+        board.forEach((id, score) -> sorted.add(new ScoreEntry(id, score)));
+        sorted.sort(descending
+                ? Comparator.comparingDouble(ScoreEntry::score).reversed()
+                : Comparator.comparingDouble(ScoreEntry::score));
+        if (start >= sorted.size() || start < 0) {
+            return List.of();
+        }
+        int end = Math.min(endInclusive, sorted.size() - 1);
+        return new ArrayList<>(sorted.subList(start, end + 1));
+    }
+
+    @Override
+    public long leaderboardSize(String leaderboard) {
+        ConcurrentHashMap<String, Double> board = leaderboards.get(leaderboard);
+        return board == null ? 0 : board.size();
+    }
 }

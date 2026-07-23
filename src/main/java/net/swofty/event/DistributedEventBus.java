@@ -7,6 +7,7 @@ import net.swofty.DataField;
 import net.swofty.ExpiringField;
 import net.swofty.ExpiringLinkedField;
 import net.swofty.LinkType;
+import net.swofty.LinkedField;
 import net.swofty.codec.Codec;
 import net.swofty.data.DataReader;
 import net.swofty.data.DataWriter;
@@ -26,6 +27,13 @@ public class DistributedEventBus extends EventBus {
 
     private final ConcurrentHashMap<String, DataField<?>> fieldRegistry = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, LinkType<?>> linkTypeRegistry = new ConcurrentHashMap<>();
+
+    private volatile RemoteChangeHandler remoteChangeHandler;
+
+    /** Registers the cache-coherency hook. Called by the API implementation after construction. */
+    public void setRemoteChangeHandler(RemoteChangeHandler handler) {
+        this.remoteChangeHandler = handler;
+    }
 
     public DistributedEventBus(PubSubHandler pubSubHandler) {
         this(pubSubHandler, UUID.randomUUID().toString());
@@ -162,6 +170,10 @@ public class DistributedEventBus extends EventBus {
         UUID player = UUID.fromString((String) msg.data.get("player"));
         Object oldValue = deserializeValue(field.codec(), msg.data.get("oldValue"));
         Object newValue = deserializeValue(field.codec(), msg.data.get("newValue"));
+        RemoteChangeHandler handler = remoteChangeHandler;
+        if (handler != null) {
+            handler.onPlayerChange(field, player, newValue);
+        }
         super.firePlayerDataChanged(field, player, oldValue, newValue);
     }
 
@@ -173,6 +185,10 @@ public class DistributedEventBus extends EventBus {
         Object oldValue = deserializeValue(field.codec(), msg.data.get("oldValue"));
         Object newValue = deserializeValue(field.codec(), msg.data.get("newValue"));
         Set<UUID> affected = listToUuidSet(msg.data.get("affected"));
+        RemoteChangeHandler handler = remoteChangeHandler;
+        if (handler != null && field instanceof LinkedField<?, ?> linkedField) {
+            handler.onLinkedChange(field, linkedField.linkType().name(), linkKey, newValue);
+        }
         super.fireLinkedDataChanged(field, linkKey, oldValue, newValue, affected);
     }
 

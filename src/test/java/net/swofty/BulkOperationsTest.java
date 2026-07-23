@@ -2,21 +2,16 @@ package net.swofty;
 
 import net.swofty.api.DataAPIImpl;
 import net.swofty.codec.Codecs;
-import net.swofty.data.format.JsonFormat;
-import net.swofty.storage.FileDataStorage;
+import net.swofty.storage.InMemoryDataStorage;
 
 import org.junit.jupiter.api.*;
-import org.junit.jupiter.api.io.TempDir;
 
-import java.nio.file.Path;
 import java.util.*;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class BulkOperationsTest {
 
-    @TempDir
-    Path tempDir;
     private DataAPIImpl api;
 
     private static final PlayerField<Integer> COINS = PlayerField.create("test", "coins", Codecs.INT, 0);
@@ -27,7 +22,8 @@ class BulkOperationsTest {
 
     @BeforeEach
     void setUp() {
-        api = new DataAPIImpl(new FileDataStorage(tempDir, new JsonFormat(), ".json"), new JsonFormat());
+        // InMemory storage maintains a leaderboard index; numeric leaderboards need no registration.
+        api = new DataAPIImpl(new InMemoryDataStorage());
     }
 
     @AfterEach

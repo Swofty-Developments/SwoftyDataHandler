@@ -6,7 +6,10 @@ import net.swofty.transaction.TransactionFunction;
 
 import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.function.Predicate;
+import java.util.function.ToDoubleFunction;
 import java.util.function.UnaryOperator;
 
 public interface DataAPI {
@@ -69,4 +72,28 @@ public interface DataAPI {
     // Bulk operations - Linked
     <K, T extends Comparable<T>> List<LeaderboardEntry<T>> getTopLinked(LinkedField<K, T> field, int limit);
     <K, T> List<K> queryLinked(LinkedField<K, T> field, Predicate<T> filter);
+
+    // Leaderboard indexing - getTop/getTopPaged are index-backed and require a LeaderboardIndex-
+    // capable storage (e.g. Redis sorted sets). No registration is needed for numeric fields: the
+    // index self-builds on first rank and every node maintains it on write. trackLeaderboard only
+    // registers a score function so a NON-numeric field can be ranked; rebuildLeaderboard forces a
+    // rebuild from stored data.
+    <T> void trackLeaderboard(PlayerField<T> field, ToDoubleFunction<T> scorer);
+    <T> void rebuildLeaderboard(PlayerField<T> field);
+
+    // Lifecycle - warm a player's data into this node before use, evict it when done.
+    // This is the primitive a proxy uses to load a player's data on the target server
+    // BEFORE moving them there, and to evict it afterwards so a later visit is never stale.
+    void load(UUID player);
+    CompletableFuture<Void> loadAsync(UUID player, Executor executor);
+    void flush(UUID player);
+    void unload(UUID player);
+    boolean isLoaded(UUID player);
+    Set<UUID> loadedPlayers();
+
+    // Lifecycle - shared/linked entities (e.g. an island or coop shared across members)
+    <K> void loadLink(LinkType<K> type, K key);
+    <K> void flushLink(LinkType<K> type, K key);
+    <K> void unloadLink(LinkType<K> type, K key);
+    <K> boolean isLinkLoaded(LinkType<K> type, K key);
 }

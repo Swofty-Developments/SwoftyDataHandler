@@ -3,12 +3,13 @@ package net.swofty.api;
 import net.swofty.*;
 import net.swofty.event.EventBus;
 import net.swofty.storage.DataStorage;
+import net.swofty.storage.LeaderboardIndex;
 
 import java.util.*;
 import java.util.function.Predicate;
 import java.util.function.UnaryOperator;
 
-public class BulkOperationExecutor {
+class BulkOperationExecutor {
     private final PlayerDataManager playerData;
     private final LinkedDataManager linkedData;
     private final DataStorage storage;
@@ -23,7 +24,31 @@ public class BulkOperationExecutor {
     }
 
     public <T extends Comparable<T>> List<LeaderboardEntry<T>> getTop(PlayerField<T> field, int limit) {
-        return getTop(field, limit, Comparator.reverseOrder());
+        LeaderboardIndex index = requireIndex();
+        playerData.ensureLeaderboardBuilt(field); // self-registers on first use, no-op thereafter
+        return fromIndex(field, index, 0, limit - 1);
+    }
+
+    // A leaderboard is always index-backed. There is no silent full-table scan: the index is built
+    // once on first use and maintained on every write, so ranking is O(log N + page).
+    private LeaderboardIndex requireIndex() {
+        if (!(storage instanceof LeaderboardIndex index)) {
+            throw new IllegalStateException("Storage " + storage.getClass().getSimpleName()
+                    + " does not support leaderboards; use a LeaderboardIndex-capable storage (e.g. RedisDataStorage)");
+        }
+        return index;
+    }
+
+    private <T> List<LeaderboardEntry<T>> fromIndex(PlayerField<T> field, LeaderboardIndex index,
+                                                    int start, int endInclusive) {
+        List<LeaderboardIndex.ScoreEntry> range = index.scoreRange(field.fullKey(), start, endInclusive, true);
+        List<LeaderboardEntry<T>> result = new ArrayList<>(range.size());
+        int rank = start + 1;
+        for (LeaderboardIndex.ScoreEntry entry : range) {
+            UUID id = UUID.fromString(entry.id());
+            result.add(new LeaderboardEntry<>(id, playerData.getFieldValue(id, field), rank++));
+        }
+        return result;
     }
 
     public <T> List<LeaderboardEntry<T>> getTop(PlayerField<T> field, int limit, Comparator<T> comparator) {
@@ -38,19 +63,12 @@ public class BulkOperationExecutor {
     }
 
     public <T extends Comparable<T>> Page<LeaderboardEntry<T>> getTopPaged(PlayerField<T> field, int page, int pageSize) {
-        List<Map.Entry<UUID, T>> entries = getAllPlayerValues(field);
-        entries.sort((a, b) -> b.getValue().compareTo(a.getValue()));
-
-        long total = entries.size();
+        LeaderboardIndex index = requireIndex();
+        playerData.ensureLeaderboardBuilt(field);
+        long total = index.leaderboardSize(field.fullKey());
         int totalPages = (int) Math.ceil((double) total / pageSize);
         int start = (page - 1) * pageSize;
-        int end = Math.min(start + pageSize, entries.size());
-
-        List<LeaderboardEntry<T>> content = new ArrayList<>();
-        for (int i = start; i < end; i++) {
-            Map.Entry<UUID, T> e = entries.get(i);
-            content.add(new LeaderboardEntry<>(e.getKey(), e.getValue(), i + 1));
-        }
+        List<LeaderboardEntry<T>> content = fromIndex(field, index, start, start + pageSize - 1);
         return new Page<>(content, page, totalPages, total);
     }
 
