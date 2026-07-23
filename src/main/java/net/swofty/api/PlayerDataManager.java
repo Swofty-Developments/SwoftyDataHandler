@@ -19,10 +19,10 @@ public class PlayerDataManager {
     private final EventBus eventBus;
     private final ConcurrentHashMap<UUID, DataContainer> cache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<UUID, Object> locks = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, TrackedLeaderboard<?>> tracked = new ConcurrentHashMap<>();
+    // Optional custom score functions, keyed by field. Numeric fields need no entry here — they
+    // are scored automatically — so leaderboards require no registration in the common case.
+    private final ConcurrentHashMap<String, ToDoubleFunction<?>> scorers = new ConcurrentHashMap<>();
     private final boolean autoPersist;
-
-    private record TrackedLeaderboard<T>(PlayerField<T> field, ToDoubleFunction<T> scorer) {}
 
     public PlayerDataManager(DataStorage storage, DataFormat format, EventBus eventBus) {
         this(storage, format, eventBus, true);
@@ -109,48 +109,73 @@ public class PlayerDataManager {
     }
 
     // ---- Leaderboard indexing ----------------------------------------------
+    //
+    // Leaderboards need no registration. The first time a field is ranked, its index is built by
+    // a one-time scan (ensureLeaderboardBuilt); from then on the index EXISTS in shared storage,
+    // and every node maintains it on write via updateScoreIfPresent. A field that is never ranked
+    // has no index, so its writes cost nothing. Numeric fields are scored automatically; a custom
+    // scorer is only needed to rank a non-numeric field.
 
     private LeaderboardIndex leaderboardIndex() {
         return storage instanceof LeaderboardIndex index ? index : null;
     }
 
-    boolean isLeaderboardTracked(String fullKey) {
-        return tracked.containsKey(fullKey);
-    }
-
-    public <T> void trackLeaderboard(PlayerField<T> field, ToDoubleFunction<T> scorer) {
-        if (leaderboardIndex() == null) {
+    private LeaderboardIndex requireLeaderboardIndex() {
+        LeaderboardIndex index = leaderboardIndex();
+        if (index == null) {
             throw new IllegalStateException("Storage " + storage.getClass().getSimpleName()
-                    + " does not maintain a leaderboard index; use a LeaderboardIndex-capable storage"
+                    + " does not support leaderboards; use a LeaderboardIndex-capable storage"
                     + " (e.g. RedisDataStorage or InMemoryDataStorage)");
         }
-        tracked.put(field.fullKey(), new TrackedLeaderboard<>(field, scorer));
+        return index;
     }
 
+    /** Optional: register a score function so a non-numeric field can be ranked. */
+    public <T> void trackLeaderboard(PlayerField<T> field, ToDoubleFunction<T> scorer) {
+        requireLeaderboardIndex();
+        scorers.put(field.fullKey(), scorer);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Double scoreOf(String fullKey, Object value) {
+        if (value == null) return null;
+        ToDoubleFunction<Object> scorer = (ToDoubleFunction<Object>) scorers.get(fullKey);
+        if (scorer != null) return scorer.applyAsDouble(value);
+        if (value instanceof Number number) return number.doubleValue();
+        return null; // not rankable without a scorer
+    }
+
+    // Maintains only leaderboards that already exist, so unranked fields cost nothing.
     private void updateLeaderboards(UUID player, DataContainer container) {
         LeaderboardIndex index = leaderboardIndex();
-        if (index == null || tracked.isEmpty()) return;
-        for (TrackedLeaderboard<?> t : tracked.values()) {
-            // Only index a field once it is materialised this session, so we never write a
-            // default score over a real one for a field that was never touched.
-            if (container.has(t.field().fullKey())) {
-                index.updateScore(t.field().fullKey(), player.toString(), score(t, container));
+        if (index == null) return;
+        for (Map.Entry<String, Object> entry : container.rawData().entrySet()) {
+            Double score = scoreOf(entry.getKey(), entry.getValue());
+            if (score != null) {
+                index.updateScoreIfPresent(entry.getKey(), player.toString(), score);
             }
         }
     }
 
-    @SuppressWarnings("unchecked")
-    private <T> double score(TrackedLeaderboard<T> t, DataContainer container) {
-        return t.scorer().applyAsDouble((T) container.get(t.field()));
+    /** Builds the index on first use by scanning existing players once; a no-op once it exists. */
+    <T> void ensureLeaderboardBuilt(PlayerField<T> field) {
+        LeaderboardIndex index = requireLeaderboardIndex();
+        if (index.leaderboardExists(field.fullKey())) return;
+        rebuildLeaderboard(field);
     }
 
-    /** Backfills the index for a tracked field by scanning existing stored players once. */
-    public <T> void rebuildLeaderboard(PlayerField<T> field, ToDoubleFunction<T> scorer) {
-        LeaderboardIndex index = leaderboardIndex();
-        if (index == null) return;
+    /** Rebuilds a field's index from stored data. Called automatically on first rank; also public. */
+    public <T> void rebuildLeaderboard(PlayerField<T> field) {
+        LeaderboardIndex index = requireLeaderboardIndex();
         for (String id : storage.listIds("players")) {
             UUID player = UUID.fromString(id);
-            index.updateScore(field.fullKey(), id, scorer.applyAsDouble(getFieldValue(player, field)));
+            T value = getFieldValue(player, field);
+            Double score = scoreOf(field.fullKey(), value);
+            if (score == null) {
+                throw new IllegalStateException("Leaderboard field '" + field.fullKey()
+                        + "' is not numeric; register a score function with trackLeaderboard(field, scorer)");
+            }
+            index.updateScore(field.fullKey(), id, score);
         }
     }
 

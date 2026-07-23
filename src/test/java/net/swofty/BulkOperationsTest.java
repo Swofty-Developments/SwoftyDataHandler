@@ -22,9 +22,8 @@ class BulkOperationsTest {
 
     @BeforeEach
     void setUp() {
-        // InMemory storage maintains a leaderboard index; leaderboards are index-only.
+        // InMemory storage maintains a leaderboard index; numeric leaderboards need no registration.
         api = new DataAPIImpl(new InMemoryDataStorage());
-        api.trackLeaderboard(COINS, Integer::doubleValue);
     }
 
     @AfterEach

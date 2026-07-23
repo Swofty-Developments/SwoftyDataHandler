@@ -24,18 +24,19 @@ public class BulkOperationExecutor {
     }
 
     public <T extends Comparable<T>> List<LeaderboardEntry<T>> getTop(PlayerField<T> field, int limit) {
-        return fromIndex(field, requireIndex(field), 0, limit - 1);
+        LeaderboardIndex index = requireIndex();
+        playerData.ensureLeaderboardBuilt(field); // self-registers on first use, no-op thereafter
+        return fromIndex(field, index, 0, limit - 1);
     }
 
-    // A leaderboard is always index-backed. The field must be registered with trackLeaderboard,
-    // which also guarantees the storage maintains the sorted index — so there is no silent
-    // full-table scan hiding behind a forgotten registration.
-    private LeaderboardIndex requireIndex(PlayerField<?> field) {
-        if (!playerData.isLeaderboardTracked(field.fullKey())) {
-            throw new IllegalStateException("Leaderboard field '" + field.fullKey()
-                    + "' must be registered with trackLeaderboard(field, scorer) before it can be ranked");
+    // A leaderboard is always index-backed. There is no silent full-table scan: the index is built
+    // once on first use and maintained on every write, so ranking is O(log N + page).
+    private LeaderboardIndex requireIndex() {
+        if (!(storage instanceof LeaderboardIndex index)) {
+            throw new IllegalStateException("Storage " + storage.getClass().getSimpleName()
+                    + " does not support leaderboards; use a LeaderboardIndex-capable storage (e.g. RedisDataStorage)");
         }
-        return (LeaderboardIndex) storage;
+        return index;
     }
 
     private <T> List<LeaderboardEntry<T>> fromIndex(PlayerField<T> field, LeaderboardIndex index,
@@ -62,7 +63,8 @@ public class BulkOperationExecutor {
     }
 
     public <T extends Comparable<T>> Page<LeaderboardEntry<T>> getTopPaged(PlayerField<T> field, int page, int pageSize) {
-        LeaderboardIndex index = requireIndex(field);
+        LeaderboardIndex index = requireIndex();
+        playerData.ensureLeaderboardBuilt(field);
         long total = index.leaderboardSize(field.fullKey());
         int totalPages = (int) Math.ceil((double) total / pageSize);
         int start = (page - 1) * pageSize;

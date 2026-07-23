@@ -311,8 +311,8 @@ public class DataAPIImpl implements DataAPI {
     }
 
     @Override
-    public <T> void rebuildLeaderboard(PlayerField<T> field, ToDoubleFunction<T> scorer) {
-        playerData.rebuildLeaderboard(field, scorer);
+    public <T> void rebuildLeaderboard(PlayerField<T> field) {
+        playerData.rebuildLeaderboard(field);
     }
 
     // ==================== Lifecycle ====================

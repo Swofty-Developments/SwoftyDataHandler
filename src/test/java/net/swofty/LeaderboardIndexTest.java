@@ -16,8 +16,8 @@ import java.util.UUID;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * The indexed leaderboard path (Redis sorted sets in production, an in-memory index here)
- * must return the same ranking as the scan-based fallback, without scanning every player.
+ * Leaderboards are index-backed and self-registering: no trackLeaderboard call is needed for a
+ * numeric field. The index builds on first rank and is maintained on every subsequent write.
  */
 class LeaderboardIndexTest {
 
@@ -27,63 +27,25 @@ class LeaderboardIndexTest {
     private static final PlayerField<Integer> COINS = PlayerField.create("game", "coins", Codecs.INT, 0);
 
     @Test
-    void rankingAnUntrackedFieldFailsFast() {
+    void numericLeaderboardWorksWithNoRegistration() {
         DataAPIImpl api = new DataAPIImpl(new InMemoryDataStorage());
-        // No trackLeaderboard call — ranking must throw instead of silently scanning every player.
-        assertThrows(IllegalStateException.class, () -> api.getTop(COINS, 10));
-        assertThrows(IllegalStateException.class, () -> api.getTopPaged(COINS, 1, 10));
-        api.shutdown();
-    }
-
-    @Test
-    void trackingOnStorageWithoutAnIndexFailsFast() {
-        DataAPIImpl api = new DataAPIImpl(new FileDataStorage(tempDir, new JsonFormat(), ".json"), new JsonFormat());
-        assertThrows(IllegalStateException.class, () -> api.trackLeaderboard(COINS, Integer::doubleValue));
-        api.shutdown();
-    }
-
-    @Test
-    void indexedGetTopMatchesInsertionRanking() {
-        DataAPIImpl api = new DataAPIImpl(new InMemoryDataStorage());
-        api.trackLeaderboard(COINS, Integer::doubleValue);
-
         UUID a = UUID.randomUUID(), b = UUID.randomUUID(), c = UUID.randomUUID();
         api.set(a, COINS, 300);
         api.set(b, COINS, 100);
         api.set(c, COINS, 200);
 
-        List<LeaderboardEntry<Integer>> top = api.getTop(COINS, 3);
+        List<LeaderboardEntry<Integer>> top = api.getTop(COINS, 3); // no trackLeaderboard
         assertEquals(List.of(a, c, b), top.stream().map(LeaderboardEntry::playerId).toList());
         assertEquals(List.of(300, 200, 100), top.stream().map(LeaderboardEntry::value).toList());
         assertEquals(1, top.get(0).rank());
-        assertEquals(3, top.get(2).rank());
         api.shutdown();
     }
 
     @Test
-    void indexReflectsUpdatesAndPaging() {
-        DataAPIImpl api = new DataAPIImpl(new InMemoryDataStorage());
-        api.trackLeaderboard(COINS, Integer::doubleValue);
-
-        UUID a = UUID.randomUUID(), b = UUID.randomUUID();
-        api.set(a, COINS, 10);
-        api.set(b, COINS, 20);
-        api.update(a, COINS, c -> c + 100); // a jumps to 110, overtaking b
-
-        assertEquals(a, api.getTop(COINS, 1).get(0).playerId());
-
-        Page<LeaderboardEntry<Integer>> page = api.getTopPaged(COINS, 1, 1);
-        assertEquals(2, page.totalElements());
-        assertEquals(2, page.totalPages());
-        assertEquals(a, page.content().get(0).playerId());
-        api.shutdown();
-    }
-
-    @Test
-    void rebuildBackfillsExistingData() {
+    void firstRankBackfillsExistingDataThenWritesKeepItCurrent() {
         InMemoryDataStorage storage = new InMemoryDataStorage();
 
-        // Data written before the leaderboard was tracked.
+        // Data written before any ranking happened.
         DataAPIImpl seed = new DataAPIImpl(storage);
         UUID a = UUID.randomUUID(), b = UUID.randomUUID();
         seed.set(a, COINS, 5);
@@ -91,10 +53,51 @@ class LeaderboardIndexTest {
         seed.shutdown();
 
         DataAPIImpl api = new DataAPIImpl(storage);
-        api.trackLeaderboard(COINS, Integer::doubleValue);
-        api.rebuildLeaderboard(COINS, Integer::doubleValue);
-
+        // First rank self-builds the index from the pre-existing data.
         assertEquals(List.of(b, a), api.getTop(COINS, 2).stream().map(LeaderboardEntry::playerId).toList());
+
+        // A later write is reflected without any re-registration.
+        api.update(a, COINS, v -> v + 100); // a -> 105, overtakes b
+        assertEquals(a, api.getTop(COINS, 1).get(0).playerId());
+        api.shutdown();
+    }
+
+    @Test
+    void paging() {
+        DataAPIImpl api = new DataAPIImpl(new InMemoryDataStorage());
+        for (int i = 1; i <= 25; i++) {
+            api.set(UUID.randomUUID(), COINS, i * 10);
+        }
+        Page<LeaderboardEntry<Integer>> page = api.getTopPaged(COINS, 1, 10);
+        assertEquals(10, page.content().size());
+        assertEquals(3, page.totalPages());
+        assertEquals(25, page.totalElements());
+        assertEquals(250, page.content().get(0).value());
+        api.shutdown();
+    }
+
+    @Test
+    void nonNumericFieldRequiresAScorer() {
+        PlayerField<String> NAME = PlayerField.create("game", "name", Codecs.STRING, "");
+        DataAPIImpl api = new DataAPIImpl(new InMemoryDataStorage());
+        api.set(UUID.randomUUID(), NAME, "abc");
+
+        // Cannot auto-score a String; ranking it without a scorer fails with a clear message.
+        assertThrows(IllegalStateException.class, () -> api.getTop(NAME, 5));
+
+        // Registering a scorer makes it rankable.
+        UUID longName = UUID.randomUUID();
+        api.set(longName, NAME, "a-very-long-name");
+        api.trackLeaderboard(NAME, String::length);
+        assertEquals(longName, api.getTop(NAME, 5).get(0).playerId());
+        api.shutdown();
+    }
+
+    @Test
+    void storageWithoutAnIndexCannotRank() {
+        DataAPIImpl api = new DataAPIImpl(new FileDataStorage(tempDir, new JsonFormat(), ".json"), new JsonFormat());
+        assertThrows(IllegalStateException.class, () -> api.getTop(COINS, 10));
+        assertThrows(IllegalStateException.class, () -> api.trackLeaderboard(COINS, Integer::doubleValue));
         api.shutdown();
     }
 }

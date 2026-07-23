@@ -32,7 +32,6 @@ class DataHandlerTest {
     @BeforeEach
     void setUp() {
         api = new DataAPIImpl(new InMemoryDataStorage());
-        api.trackLeaderboard(COINS, Integer::doubleValue);
     }
 
     @AfterEach

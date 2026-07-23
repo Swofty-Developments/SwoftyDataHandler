@@ -429,22 +429,26 @@ released by its owner and a lease bounds a crashed holder.
 
 ## Indexed Leaderboards
 
-Leaderboards are always index-backed — there is no silent full-table scan. Register the field once
-(which requires a `LeaderboardIndex`-capable storage such as `RedisDataStorage`, backed by sorted
-sets, or `InMemoryDataStorage` for single-node/tests); every write then maintains the index and
-ranking reads only the requested slice:
+Leaderboards are index-backed and **self-registering — no setup for numeric fields**. The first time
+you rank a field its index is built from existing data in one scan; from then on every node maintains
+it on write, and ranking reads only the requested slice. This requires a `LeaderboardIndex`-capable
+storage (`RedisDataStorage`, backed by sorted sets, or `InMemoryDataStorage` for single-node/tests):
 
 ```java
-api.trackLeaderboard(COINS, Integer::doubleValue); // required; throws if the storage can't index
-api.rebuildLeaderboard(COINS, Integer::doubleValue); // one-time backfill of pre-existing data
-
-api.getTop(COINS, 10);         // O(log N + page)
+api.getTop(COINS, 10);         // just works — O(log N + page), no registration
 api.getTopPaged(COINS, 1, 50);
 ```
 
-`getTop`/`getTopPaged` on a field that was never tracked throw `IllegalStateException` rather than
-quietly falling back to an O(N) scan. If you genuinely need an ad-hoc full sort by a custom
-ordering, `getTop(field, limit, comparator)` is the explicit scan-based escape hatch.
+Only a **non-numeric** field needs a score function, since a sorted set ranks by a number:
+
+```java
+api.trackLeaderboard(NAME, String::length); // rank players by name length
+```
+
+`rebuildLeaderboard(field)` forces a rebuild from stored data if you ever need it. Storage backends
+that don't maintain an index (e.g. `FileDataStorage`) throw on ranking rather than silently scanning;
+`getTop(field, limit, comparator)` remains as the explicit scan-based escape hatch for ad-hoc custom
+orderings.
 
 ## Lifecycle
 

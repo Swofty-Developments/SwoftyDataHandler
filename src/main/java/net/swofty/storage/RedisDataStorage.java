@@ -77,10 +77,29 @@ public class RedisDataStorage implements DataStorage, LeaderboardIndex {
         return prefix + ":lb:" + leaderboard;
     }
 
+    private static final String ZADD_IF_EXISTS =
+            "if redis.call('exists', KEYS[1]) == 1 then return redis.call('zadd', KEYS[1], ARGV[1], ARGV[2]) else return 0 end";
+
     @Override
     public void updateScore(String leaderboard, String id, double score) {
         try (Jedis jedis = pool.getResource()) {
             jedis.zadd(leaderboardKey(leaderboard), score, id);
+        }
+    }
+
+    @Override
+    public void updateScoreIfPresent(String leaderboard, String id, double score) {
+        try (Jedis jedis = pool.getResource()) {
+            jedis.eval(ZADD_IF_EXISTS,
+                    java.util.List.of(leaderboardKey(leaderboard)),
+                    java.util.List.of(Double.toString(score), id));
+        }
+    }
+
+    @Override
+    public boolean leaderboardExists(String leaderboard) {
+        try (Jedis jedis = pool.getResource()) {
+            return jedis.exists(leaderboardKey(leaderboard));
         }
     }
 

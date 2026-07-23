@@ -46,6 +46,20 @@ public class InMemoryDataStorage implements DataStorage, LeaderboardIndex {
     }
 
     @Override
+    public void updateScoreIfPresent(String leaderboard, String id, double score) {
+        ConcurrentHashMap<String, Double> board = leaderboards.get(leaderboard);
+        if (board != null) {
+            board.put(id, score);
+        }
+    }
+
+    @Override
+    public boolean leaderboardExists(String leaderboard) {
+        ConcurrentHashMap<String, Double> board = leaderboards.get(leaderboard);
+        return board != null && !board.isEmpty();
+    }
+
+    @Override
     public void removeFromLeaderboard(String leaderboard, String id) {
         ConcurrentHashMap<String, Double> board = leaderboards.get(leaderboard);
         if (board != null) {

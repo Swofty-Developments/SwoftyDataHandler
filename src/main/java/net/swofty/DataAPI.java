@@ -73,12 +73,13 @@ public interface DataAPI {
     <K, T extends Comparable<T>> List<LeaderboardEntry<T>> getTopLinked(LinkedField<K, T> field, int limit);
     <K, T> List<K> queryLinked(LinkedField<K, T> field, Predicate<T> filter);
 
-    // Leaderboard indexing - a leaderboard field MUST be registered here (which requires a
-    // LeaderboardIndex-capable storage, e.g. Redis sorted sets); getTop/getTopPaged then read a
-    // ranked slice from the index and throw for an unregistered field rather than scanning every
-    // stored player. rebuildLeaderboard backfills the index from existing data once.
+    // Leaderboard indexing - getTop/getTopPaged are index-backed and require a LeaderboardIndex-
+    // capable storage (e.g. Redis sorted sets). No registration is needed for numeric fields: the
+    // index self-builds on first rank and every node maintains it on write. trackLeaderboard only
+    // registers a score function so a NON-numeric field can be ranked; rebuildLeaderboard forces a
+    // rebuild from stored data.
     <T> void trackLeaderboard(PlayerField<T> field, ToDoubleFunction<T> scorer);
-    <T> void rebuildLeaderboard(PlayerField<T> field, ToDoubleFunction<T> scorer);
+    <T> void rebuildLeaderboard(PlayerField<T> field);
 
     // Lifecycle - warm a player's data into this node before use, evict it when done.
     // This is the primitive a proxy uses to load a player's data on the target server
