@@ -367,12 +367,89 @@ new BinaryFormat() // compact, good for production
 
 Both implement `DataFormat` and can be used with any storage backend.
 
+## Multi-Server Lifecycle
+
+Across a fleet of servers a player (or a shared entity such as an island) is authoritative on
+exactly one node at a time. The lifecycle API lets a node warm that data into its cache before
+use and evict it afterwards, so a later visit to any node is never served a stale value.
+
+```java
+// Warm a player's whole document into this node in a single storage read.
+api.load(player);                       // synchronous
+api.loadAsync(player, executor);        // CompletableFuture<Void>
+api.isLoaded(player);                   // boolean
+
+// Persist pending changes and drop the player from this node's cache.
+api.unload(player);                     // flush + evict
+api.flush(player);                      // flush without evicting
+
+// Shared/linked entities have the same lifecycle.
+api.loadLink(ISLAND, islandId);
+api.unloadLink(ISLAND, islandId);
+```
+
+This is the primitive a proxy uses to implement "load the player's data on the target server
+*before* moving them there": the proxy asks the destination to `load(player)`, waits for the
+ack, then connects the player. Because the origin calls `unload(player)` on disconnect, the
+destination always starts from fresh storage.
+
+**Deferred persistence.** By default every write is flushed immediately. Pass `autoPersist = false`
+to buffer a whole play session in the cache and write it back once, on `flush`/`unload`
+(`shutdown` flushes everything so nothing is lost):
+
+```java
+DataAPI api = new DataAPIImpl(storage, new JsonFormat(), pubSub, /* autoPersist */ false);
+```
+
+**Cache coherency.** With a distributed event bus, a change made on another node to an entity that
+is currently loaded here updates the local view in place, so subscribed fields never go stale
+while a player is online. Eviction on `unload` handles the general case.
+
+## Distributed Locking
+
+Transactions guard a JVM-local lock by default, which only serialises threads within one process.
+Supply a `DistributedLock` to get true cross-node mutual exclusion — required when the same shared
+entity can be mutated from more than one server (e.g. a coop bank):
+
+```java
+DistributedLock lock = new RedisDistributedLock(jedisPool);   // or InMemoryDistributedLock for one node
+DataAPI api = new DataAPIImpl(storage, new JsonFormat(), pubSub, true, lock);
+
+// Transactions now take a cross-node lock keyed by the entity, in addition to the local monitor.
+api.transactionDirect(coopId, COOP, tx -> { tx.update(BANK, b -> b - 1000L); return null; });
+
+// The same primitive is available for app-level critical sections:
+try (var handle = ((DataAPIImpl) api).lock("coop-transfer:" + coopId, Duration.ofSeconds(5))) {
+    // ... multi-entity critical section ...
+}
+```
+
+The Redis implementation uses `SET NX PX` with a compare-and-delete release, so a lock is only
+released by its owner and a lease bounds a crashed holder.
+
+## Indexed Leaderboards
+
+`getTop`/`getTopPaged` scan every stored player by default. When the backend maintains sorted
+indexes (Redis sorted sets, or the in-memory index for single-node/tests), track a field so the
+ranked slice is read directly instead:
+
+```java
+api.trackLeaderboard(COINS, Integer::doubleValue); // maintain an index on every write
+api.rebuildLeaderboard(COINS, Integer::doubleValue); // one-time backfill of pre-existing data
+
+api.getTop(COINS, 10);         // now O(log N + page) instead of an O(N) scan
+api.getTopPaged(COINS, 1, 50);
+```
+
+Untracked fields and backends without the capability fall through to the scan, so this is purely
+an accelerator.
+
 ## Lifecycle
 
 Always shut down the API when done:
 
 ```java
-api.shutdown(); // stops expiration timers, closes Pub/Sub subscribers
+api.shutdown(); // flushes deferred writes, stops expiration timers, closes Pub/Sub subscribers
 ```
 
 For Redis storage, also close the storage:
