@@ -4,6 +4,7 @@ import net.swofty.*;
 import net.swofty.data.DataFormat;
 import net.swofty.data.format.JsonFormat;
 import net.swofty.event.*;
+import net.swofty.lock.DistributedLock;
 import net.swofty.storage.DataStorage;
 import net.swofty.transaction.TransactionConsumer;
 import net.swofty.transaction.TransactionFunction;
@@ -24,24 +25,34 @@ public class DataAPIImpl implements DataAPI {
     private final TransactionManager transactionManager;
     private final EventBus eventBus;
     private final BulkOperationExecutor bulkOperations;
+    private final DistributedLock distributedLock;
 
     public DataAPIImpl(DataStorage storage, DataFormat format, PubSubHandler pubSub) {
         this(storage, format, pubSub, true);
     }
 
-    /**
-     * @param autoPersist when true (the default) every write is flushed to storage immediately;
-     *                    when false writes stay in the cache until {@link #flush(UUID)} or
-     *                    {@link #unload(UUID)}, letting a node batch a play session into one write.
-     */
     public DataAPIImpl(DataStorage storage, DataFormat format, PubSubHandler pubSub, boolean autoPersist) {
+        this(storage, format, pubSub, autoPersist, null);
+    }
+
+    /**
+     * @param autoPersist     when true (the default) every write is flushed to storage immediately;
+     *                        when false writes stay in the cache until {@link #flush(UUID)} or
+     *                        {@link #unload(UUID)}, letting a node batch a play session into one write.
+     * @param distributedLock when non-null, transactions and {@link #lock(String, Duration)} use it for
+     *                        cross-node mutual exclusion; when null they fall back to a JVM-local lock.
+     */
+    public DataAPIImpl(DataStorage storage, DataFormat format, PubSubHandler pubSub, boolean autoPersist,
+                       DistributedLock distributedLock) {
         this.storage = storage;
+        this.distributedLock = distributedLock;
         this.eventBus = (pubSub != null) ? new DistributedEventBus(pubSub) : new EventBus();
         this.linkRegistry = new LinkRegistryImpl();
         this.playerData = new PlayerDataManager(storage, format, eventBus, autoPersist);
         this.linkedData = new LinkedDataManager(storage, format, eventBus, linkRegistry, autoPersist);
         this.expirationManager = new ExpirationManager();
-        this.transactionManager = new TransactionManager(playerData, linkedData, linkRegistry);
+        this.transactionManager = new TransactionManager(playerData, linkedData, linkRegistry,
+                distributedLock, Duration.ofSeconds(10));
         this.bulkOperations = new BulkOperationExecutor(playerData, linkedData, storage, eventBus);
 
         // Keep locally cached containers coherent with changes made on other nodes.
@@ -343,6 +354,18 @@ public class DataAPIImpl implements DataAPI {
     @Override
     public <K> boolean isLinkLoaded(LinkType<K> type, K key) {
         return linkedData.isLinkedLoaded(type.name(), key);
+    }
+
+    /**
+     * Acquires the configured {@link DistributedLock} for an arbitrary key, for app-level critical
+     * sections that span more than one field or entity (e.g. transferring coins between two coops).
+     * Use with try-with-resources. Requires a distributed lock to have been supplied.
+     */
+    public DistributedLock.Handle lock(String key, Duration timeout) {
+        if (distributedLock == null) {
+            throw new IllegalStateException("No DistributedLock configured on this DataAPI");
+        }
+        return distributedLock.acquire(key, timeout);
     }
 
     public void shutdown() {

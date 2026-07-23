@@ -3,8 +3,10 @@ package net.swofty.api;
 import net.swofty.LinkedField;
 import net.swofty.PlayerField;
 import net.swofty.LinkType;
+import net.swofty.lock.DistributedLock;
 import net.swofty.transaction.*;
 
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
@@ -12,62 +14,85 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.UnaryOperator;
 
 public class TransactionManager {
+    private static final DistributedLock.Handle NO_OP = () -> {};
+
     private final PlayerDataManager playerData;
     private final LinkedDataManager linkedData;
     private final LinkRegistryImpl linkRegistry;
+    private final DistributedLock distributedLock;
+    private final Duration lockTimeout;
 
     public TransactionManager(PlayerDataManager playerData, LinkedDataManager linkedData, LinkRegistryImpl linkRegistry) {
+        this(playerData, linkedData, linkRegistry, null, Duration.ofSeconds(10));
+    }
+
+    public TransactionManager(PlayerDataManager playerData, LinkedDataManager linkedData, LinkRegistryImpl linkRegistry,
+                              DistributedLock distributedLock, Duration lockTimeout) {
         this.playerData = playerData;
         this.linkedData = linkedData;
         this.linkRegistry = linkRegistry;
+        this.distributedLock = distributedLock;
+        this.lockTimeout = lockTimeout;
+    }
+
+    // Cross-node mutual exclusion when a distributed lock is configured; a no-op handle
+    // otherwise, leaving the JVM-local monitor as the only guard (single-node behaviour).
+    private DistributedLock.Handle acquire(String key) {
+        return distributedLock == null ? NO_OP : distributedLock.acquire(key, lockTimeout);
     }
 
     public <R> R execute(UUID player, TransactionFunction<R> action) {
-        synchronized (playerData.getLock(player)) {
-            TransactionContext tx = new TransactionContext(player);
-            try {
-                R result = action.apply(tx);
-                tx.commit();
-                return result;
-            } catch (TransactionAbortException e) {
-                tx.rollback();
-                return null;
-            } catch (Exception e) {
-                tx.rollback();
-                throw e;
+        try (DistributedLock.Handle ignored = acquire("player:" + player)) {
+            synchronized (playerData.getLock(player)) {
+                TransactionContext tx = new TransactionContext(player);
+                try {
+                    R result = action.apply(tx);
+                    tx.commit();
+                    return result;
+                } catch (TransactionAbortException e) {
+                    tx.rollback();
+                    return null;
+                } catch (Exception e) {
+                    tx.rollback();
+                    throw e;
+                }
             }
         }
     }
 
     public void execute(UUID player, TransactionConsumer action) {
-        synchronized (playerData.getLock(player)) {
-            TransactionContext tx = new TransactionContext(player);
-            try {
-                action.accept(tx);
-                tx.commit();
-            } catch (TransactionAbortException e) {
-                tx.rollback();
-            } catch (Exception e) {
-                tx.rollback();
-                throw e;
+        try (DistributedLock.Handle ignored = acquire("player:" + player)) {
+            synchronized (playerData.getLock(player)) {
+                TransactionContext tx = new TransactionContext(player);
+                try {
+                    action.accept(tx);
+                    tx.commit();
+                } catch (TransactionAbortException e) {
+                    tx.rollback();
+                } catch (Exception e) {
+                    tx.rollback();
+                    throw e;
+                }
             }
         }
     }
 
     public <K, R> R executeDirect(K key, LinkType<K> type, TransactionFunction<R> action) {
         String ck = LinkedDataManager.compositeKey(type.name(), key);
-        synchronized (linkedData.getLock(ck)) {
-            TransactionContext tx = new TransactionContext(null);
-            try {
-                R result = action.apply(tx);
-                tx.commit();
-                return result;
-            } catch (TransactionAbortException e) {
-                tx.rollback();
-                return null;
-            } catch (Exception e) {
-                tx.rollback();
-                throw e;
+        try (DistributedLock.Handle ignored = acquire("linked:" + ck)) {
+            synchronized (linkedData.getLock(ck)) {
+                TransactionContext tx = new TransactionContext(null);
+                try {
+                    R result = action.apply(tx);
+                    tx.commit();
+                    return result;
+                } catch (TransactionAbortException e) {
+                    tx.rollback();
+                    return null;
+                } catch (Exception e) {
+                    tx.rollback();
+                    throw e;
+                }
             }
         }
     }
