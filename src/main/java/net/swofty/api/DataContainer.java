@@ -100,6 +100,17 @@ public class DataContainer {
         return format.writeRaw(merged);
     }
 
+    /**
+     * Applies a value that another node has already persisted. Updates the live view so
+     * local reads are fresh, but preserves the prior dirty state so a clean (e.g. read-only)
+     * container does not get marked dirty and re-persist stale sibling fields on unload.
+     */
+    public <T> void applyRemote(DataField<T> field, T value) {
+        boolean wasDirty = this.dirty;
+        set(field, value);
+        this.dirty = wasDirty;
+    }
+
     /** Records the bytes just written to storage as the new backing document and clears the dirty flag. */
     public void markPersisted(byte[] bytes) {
         this.backingDocument = bytes;

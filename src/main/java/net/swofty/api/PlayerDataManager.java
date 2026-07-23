@@ -17,11 +17,17 @@ public class PlayerDataManager {
     private final EventBus eventBus;
     private final ConcurrentHashMap<UUID, DataContainer> cache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<UUID, Object> locks = new ConcurrentHashMap<>();
+    private final boolean autoPersist;
 
     public PlayerDataManager(DataStorage storage, DataFormat format, EventBus eventBus) {
+        this(storage, format, eventBus, true);
+    }
+
+    public PlayerDataManager(DataStorage storage, DataFormat format, EventBus eventBus, boolean autoPersist) {
         this.storage = storage;
         this.format = format;
         this.eventBus = eventBus;
+        this.autoPersist = autoPersist;
     }
 
     public Object getLock(UUID player) {
@@ -76,7 +82,9 @@ public class PlayerDataManager {
         // drops fields that were never read this session.
         ensureDocumentLoaded(player, container);
         container.set(field, value);
-        persist(player);
+        if (autoPersist) {
+            persist(player);
+        }
     }
 
     private void ensureDocumentLoaded(UUID player, DataContainer container) {
@@ -91,6 +99,70 @@ public class PlayerDataManager {
             byte[] bytes = container.serialize(format);
             storage.save("players", player.toString(), bytes);
             container.markPersisted(bytes);
+        }
+    }
+
+    // ---- Lifecycle ----------------------------------------------------------
+
+    /** Warms the player's whole document into this node's cache in a single storage read. */
+    public void load(UUID player) {
+        synchronized (getLock(player)) {
+            DataContainer container = getContainer(player);
+            if (!container.isDocumentLoaded()) {
+                container.loadDocument(format, storage.load("players", player.toString()));
+            }
+        }
+    }
+
+    /** Persists pending changes for a player if the cache holds unsaved edits. */
+    public void flush(UUID player) {
+        synchronized (getLock(player)) {
+            DataContainer container = cache.get(player);
+            if (container != null && container.isDirty()) {
+                persist(player);
+            }
+        }
+    }
+
+    /** Flushes pending changes then evicts the player from this node's cache. */
+    public void unload(UUID player) {
+        synchronized (getLock(player)) {
+            DataContainer container = cache.get(player);
+            if (container != null && container.isDirty()) {
+                persist(player);
+            }
+            cache.remove(player);
+        }
+        locks.remove(player);
+    }
+
+    public boolean isLoaded(UUID player) {
+        return cache.containsKey(player);
+    }
+
+    public Set<UUID> loadedPlayers() {
+        return new HashSet<>(cache.keySet());
+    }
+
+    /** Flushes every cached player. Used on shutdown so deferred writes are not lost. */
+    public void flushAll() {
+        for (UUID player : cache.keySet()) {
+            flush(player);
+        }
+    }
+
+    /**
+     * Applies a change that originated on another node to the locally cached container,
+     * without re-persisting or re-firing events. Only touches players that are currently
+     * loaded here, so it never resurrects an evicted or never-loaded entity.
+     */
+    <T> void applyRemote(DataField<T> field, UUID player, T newValue) {
+        DataContainer container = cache.get(player);
+        if (container == null) return;
+        synchronized (getLock(player)) {
+            container = cache.get(player);
+            if (container == null) return;
+            container.applyRemote(field, newValue);
         }
     }
 

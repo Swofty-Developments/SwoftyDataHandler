@@ -10,6 +10,8 @@ import net.swofty.transaction.TransactionFunction;
 
 import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.function.Predicate;
 import java.util.function.UnaryOperator;
 
@@ -24,14 +26,38 @@ public class DataAPIImpl implements DataAPI {
     private final BulkOperationExecutor bulkOperations;
 
     public DataAPIImpl(DataStorage storage, DataFormat format, PubSubHandler pubSub) {
+        this(storage, format, pubSub, true);
+    }
+
+    /**
+     * @param autoPersist when true (the default) every write is flushed to storage immediately;
+     *                    when false writes stay in the cache until {@link #flush(UUID)} or
+     *                    {@link #unload(UUID)}, letting a node batch a play session into one write.
+     */
+    public DataAPIImpl(DataStorage storage, DataFormat format, PubSubHandler pubSub, boolean autoPersist) {
         this.storage = storage;
         this.eventBus = (pubSub != null) ? new DistributedEventBus(pubSub) : new EventBus();
         this.linkRegistry = new LinkRegistryImpl();
-        this.playerData = new PlayerDataManager(storage, format, eventBus);
-        this.linkedData = new LinkedDataManager(storage, format, eventBus, linkRegistry);
+        this.playerData = new PlayerDataManager(storage, format, eventBus, autoPersist);
+        this.linkedData = new LinkedDataManager(storage, format, eventBus, linkRegistry, autoPersist);
         this.expirationManager = new ExpirationManager();
         this.transactionManager = new TransactionManager(playerData, linkedData, linkRegistry);
         this.bulkOperations = new BulkOperationExecutor(playerData, linkedData, storage, eventBus);
+
+        // Keep locally cached containers coherent with changes made on other nodes.
+        if (eventBus instanceof DistributedEventBus distributed) {
+            distributed.setRemoteChangeHandler(new RemoteChangeHandler() {
+                @Override
+                public <T> void onPlayerChange(DataField<T> field, UUID player, T newValue) {
+                    playerData.applyRemote(field, player, newValue);
+                }
+
+                @Override
+                public <T> void onLinkedChange(DataField<T> field, String linkTypeName, String linkKey, T newValue) {
+                    linkedData.applyRemote(linkTypeName, linkKey, field, newValue);
+                }
+            });
+        }
     }
 
     public DataAPIImpl(DataStorage storage, DataFormat format) {
@@ -269,7 +295,60 @@ public class DataAPIImpl implements DataAPI {
 
     // ==================== Lifecycle ====================
 
+    @Override
+    public void load(UUID player) {
+        playerData.load(player);
+    }
+
+    @Override
+    public CompletableFuture<Void> loadAsync(UUID player, Executor executor) {
+        return CompletableFuture.runAsync(() -> playerData.load(player), executor);
+    }
+
+    @Override
+    public void flush(UUID player) {
+        playerData.flush(player);
+    }
+
+    @Override
+    public void unload(UUID player) {
+        playerData.unload(player);
+    }
+
+    @Override
+    public boolean isLoaded(UUID player) {
+        return playerData.isLoaded(player);
+    }
+
+    @Override
+    public Set<UUID> loadedPlayers() {
+        return playerData.loadedPlayers();
+    }
+
+    @Override
+    public <K> void loadLink(LinkType<K> type, K key) {
+        linkedData.loadLinked(type.name(), key);
+    }
+
+    @Override
+    public <K> void flushLink(LinkType<K> type, K key) {
+        linkedData.flushLinked(type.name(), key);
+    }
+
+    @Override
+    public <K> void unloadLink(LinkType<K> type, K key) {
+        linkedData.unloadLinked(type.name(), key);
+    }
+
+    @Override
+    public <K> boolean isLinkLoaded(LinkType<K> type, K key) {
+        return linkedData.isLinkedLoaded(type.name(), key);
+    }
+
     public void shutdown() {
+        // Flush any deferred writes so nothing is lost on a clean shutdown.
+        playerData.flushAll();
+        linkedData.flushAll();
         expirationManager.shutdown();
         if (eventBus instanceof DistributedEventBus deb) {
             deb.shutdown();

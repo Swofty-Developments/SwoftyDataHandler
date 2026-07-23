@@ -6,6 +6,8 @@ import net.swofty.transaction.TransactionFunction;
 
 import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.function.Predicate;
 import java.util.function.UnaryOperator;
 
@@ -69,4 +71,20 @@ public interface DataAPI {
     // Bulk operations - Linked
     <K, T extends Comparable<T>> List<LeaderboardEntry<T>> getTopLinked(LinkedField<K, T> field, int limit);
     <K, T> List<K> queryLinked(LinkedField<K, T> field, Predicate<T> filter);
+
+    // Lifecycle - warm a player's data into this node before use, evict it when done.
+    // This is the primitive a proxy uses to load a player's data on the target server
+    // BEFORE moving them there, and to evict it afterwards so a later visit is never stale.
+    void load(UUID player);
+    CompletableFuture<Void> loadAsync(UUID player, Executor executor);
+    void flush(UUID player);
+    void unload(UUID player);
+    boolean isLoaded(UUID player);
+    Set<UUID> loadedPlayers();
+
+    // Lifecycle - shared/linked entities (e.g. an island or coop shared across members)
+    <K> void loadLink(LinkType<K> type, K key);
+    <K> void flushLink(LinkType<K> type, K key);
+    <K> void unloadLink(LinkType<K> type, K key);
+    <K> boolean isLinkLoaded(LinkType<K> type, K key);
 }
