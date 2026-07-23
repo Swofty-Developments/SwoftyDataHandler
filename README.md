@@ -429,20 +429,22 @@ released by its owner and a lease bounds a crashed holder.
 
 ## Indexed Leaderboards
 
-`getTop`/`getTopPaged` scan every stored player by default. When the backend maintains sorted
-indexes (Redis sorted sets, or the in-memory index for single-node/tests), track a field so the
-ranked slice is read directly instead:
+Leaderboards are always index-backed — there is no silent full-table scan. Register the field once
+(which requires a `LeaderboardIndex`-capable storage such as `RedisDataStorage`, backed by sorted
+sets, or `InMemoryDataStorage` for single-node/tests); every write then maintains the index and
+ranking reads only the requested slice:
 
 ```java
-api.trackLeaderboard(COINS, Integer::doubleValue); // maintain an index on every write
+api.trackLeaderboard(COINS, Integer::doubleValue); // required; throws if the storage can't index
 api.rebuildLeaderboard(COINS, Integer::doubleValue); // one-time backfill of pre-existing data
 
-api.getTop(COINS, 10);         // now O(log N + page) instead of an O(N) scan
+api.getTop(COINS, 10);         // O(log N + page)
 api.getTopPaged(COINS, 1, 50);
 ```
 
-Untracked fields and backends without the capability fall through to the scan, so this is purely
-an accelerator.
+`getTop`/`getTopPaged` on a field that was never tracked throw `IllegalStateException` rather than
+quietly falling back to an O(N) scan. If you genuinely need an ad-hoc full sort by a custom
+ordering, `getTop(field, limit, comparator)` is the explicit scan-based escape hatch.
 
 ## Lifecycle
 

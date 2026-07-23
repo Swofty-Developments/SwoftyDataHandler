@@ -119,6 +119,11 @@ public class PlayerDataManager {
     }
 
     public <T> void trackLeaderboard(PlayerField<T> field, ToDoubleFunction<T> scorer) {
+        if (leaderboardIndex() == null) {
+            throw new IllegalStateException("Storage " + storage.getClass().getSimpleName()
+                    + " does not maintain a leaderboard index; use a LeaderboardIndex-capable storage"
+                    + " (e.g. RedisDataStorage or InMemoryDataStorage)");
+        }
         tracked.put(field.fullKey(), new TrackedLeaderboard<>(field, scorer));
     }
 

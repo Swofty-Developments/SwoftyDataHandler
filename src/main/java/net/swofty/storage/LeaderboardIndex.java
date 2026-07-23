@@ -3,11 +3,11 @@ package net.swofty.storage;
 import java.util.List;
 
 /**
- * An optional capability a {@link DataStorage} may implement to maintain sorted indexes
- * (e.g. Redis sorted sets) for leaderboard fields. When present, {@code getTop}/{@code getTopPaged}
- * for a tracked field read the ranked slice directly instead of scanning and deserializing every
- * stored entity, turning an O(N) query into O(log N + page). When absent, the API falls back to
- * the scan-based implementation, so this is purely additive.
+ * A capability a {@link DataStorage} may implement to maintain sorted indexes (e.g. Redis sorted
+ * sets) for leaderboard fields. It is the sole backing for {@code getTop}/{@code getTopPaged}:
+ * registering a field with {@code trackLeaderboard} requires an index-capable storage, and ranking
+ * reads the requested slice directly ({@code O(log N + page)}) rather than scanning and
+ * deserializing every stored entity. A field that was never registered throws instead of scanning.
  */
 public interface LeaderboardIndex {
 

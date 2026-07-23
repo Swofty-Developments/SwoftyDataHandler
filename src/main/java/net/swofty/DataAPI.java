@@ -73,9 +73,10 @@ public interface DataAPI {
     <K, T extends Comparable<T>> List<LeaderboardEntry<T>> getTopLinked(LinkedField<K, T> field, int limit);
     <K, T> List<K> queryLinked(LinkedField<K, T> field, Predicate<T> filter);
 
-    // Leaderboard indexing - when the storage backend maintains sorted indexes (e.g. Redis
-    // sorted sets), track a field so getTop/getTopPaged read a ranked slice instead of scanning
-    // every stored player. rebuildLeaderboard backfills the index from existing data once.
+    // Leaderboard indexing - a leaderboard field MUST be registered here (which requires a
+    // LeaderboardIndex-capable storage, e.g. Redis sorted sets); getTop/getTopPaged then read a
+    // ranked slice from the index and throw for an unregistered field rather than scanning every
+    // stored player. rebuildLeaderboard backfills the index from existing data once.
     <T> void trackLeaderboard(PlayerField<T> field, ToDoubleFunction<T> scorer);
     <T> void rebuildLeaderboard(PlayerField<T> field, ToDoubleFunction<T> scorer);
 

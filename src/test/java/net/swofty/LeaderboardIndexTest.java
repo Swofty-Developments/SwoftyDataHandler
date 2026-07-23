@@ -2,10 +2,14 @@ package net.swofty;
 
 import net.swofty.api.DataAPIImpl;
 import net.swofty.codec.Codecs;
+import net.swofty.data.format.JsonFormat;
+import net.swofty.storage.FileDataStorage;
 import net.swofty.storage.InMemoryDataStorage;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Path;
 import java.util.List;
 import java.util.UUID;
 
@@ -17,7 +21,26 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 class LeaderboardIndexTest {
 
+    @TempDir
+    Path tempDir;
+
     private static final PlayerField<Integer> COINS = PlayerField.create("game", "coins", Codecs.INT, 0);
+
+    @Test
+    void rankingAnUntrackedFieldFailsFast() {
+        DataAPIImpl api = new DataAPIImpl(new InMemoryDataStorage());
+        // No trackLeaderboard call — ranking must throw instead of silently scanning every player.
+        assertThrows(IllegalStateException.class, () -> api.getTop(COINS, 10));
+        assertThrows(IllegalStateException.class, () -> api.getTopPaged(COINS, 1, 10));
+        api.shutdown();
+    }
+
+    @Test
+    void trackingOnStorageWithoutAnIndexFailsFast() {
+        DataAPIImpl api = new DataAPIImpl(new FileDataStorage(tempDir, new JsonFormat(), ".json"), new JsonFormat());
+        assertThrows(IllegalStateException.class, () -> api.trackLeaderboard(COINS, Integer::doubleValue));
+        api.shutdown();
+    }
 
     @Test
     void indexedGetTopMatchesInsertionRanking() {

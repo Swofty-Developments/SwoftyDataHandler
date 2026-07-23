@@ -24,20 +24,18 @@ public class BulkOperationExecutor {
     }
 
     public <T extends Comparable<T>> List<LeaderboardEntry<T>> getTop(PlayerField<T> field, int limit) {
-        LeaderboardIndex index = indexFor(field);
-        if (index != null) {
-            return fromIndex(field, index, 0, limit - 1);
-        }
-        return getTop(field, limit, Comparator.reverseOrder());
+        return fromIndex(field, requireIndex(field), 0, limit - 1);
     }
 
-    // The sorted index only exists when the backend maintains one AND the field is tracked;
-    // otherwise we fall back to the scan below, so this is purely an accelerator.
-    private LeaderboardIndex indexFor(PlayerField<?> field) {
-        if (storage instanceof LeaderboardIndex index && playerData.isLeaderboardTracked(field.fullKey())) {
-            return index;
+    // A leaderboard is always index-backed. The field must be registered with trackLeaderboard,
+    // which also guarantees the storage maintains the sorted index — so there is no silent
+    // full-table scan hiding behind a forgotten registration.
+    private LeaderboardIndex requireIndex(PlayerField<?> field) {
+        if (!playerData.isLeaderboardTracked(field.fullKey())) {
+            throw new IllegalStateException("Leaderboard field '" + field.fullKey()
+                    + "' must be registered with trackLeaderboard(field, scorer) before it can be ranked");
         }
-        return null;
+        return (LeaderboardIndex) storage;
     }
 
     private <T> List<LeaderboardEntry<T>> fromIndex(PlayerField<T> field, LeaderboardIndex index,
@@ -64,27 +62,11 @@ public class BulkOperationExecutor {
     }
 
     public <T extends Comparable<T>> Page<LeaderboardEntry<T>> getTopPaged(PlayerField<T> field, int page, int pageSize) {
-        LeaderboardIndex index = indexFor(field);
-        if (index != null) {
-            long total = index.leaderboardSize(field.fullKey());
-            int totalPages = (int) Math.ceil((double) total / pageSize);
-            int start = (page - 1) * pageSize;
-            List<LeaderboardEntry<T>> content = fromIndex(field, index, start, start + pageSize - 1);
-            return new Page<>(content, page, totalPages, total);
-        }
-        List<Map.Entry<UUID, T>> entries = getAllPlayerValues(field);
-        entries.sort((a, b) -> b.getValue().compareTo(a.getValue()));
-
-        long total = entries.size();
+        LeaderboardIndex index = requireIndex(field);
+        long total = index.leaderboardSize(field.fullKey());
         int totalPages = (int) Math.ceil((double) total / pageSize);
         int start = (page - 1) * pageSize;
-        int end = Math.min(start + pageSize, entries.size());
-
-        List<LeaderboardEntry<T>> content = new ArrayList<>();
-        for (int i = start; i < end; i++) {
-            Map.Entry<UUID, T> e = entries.get(i);
-            content.add(new LeaderboardEntry<>(e.getKey(), e.getValue(), i + 1));
-        }
+        List<LeaderboardEntry<T>> content = fromIndex(field, index, start, start + pageSize - 1);
         return new Page<>(content, page, totalPages, total);
     }
 
