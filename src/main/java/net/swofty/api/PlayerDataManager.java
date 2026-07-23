@@ -13,7 +13,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.ToDoubleFunction;
 import java.util.function.UnaryOperator;
 
-public class PlayerDataManager {
+// Internal to net.swofty.api — reach it through DataAPI / DataAPIImpl, not directly.
+class PlayerDataManager {
     private final DataStorage storage;
     private final DataFormat format;
     private final EventBus eventBus;

@@ -12,7 +12,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.*;
 
-public class ExpirationManager {
+class ExpirationManager {
     private final ConcurrentHashMap<String, Instant> expirations = new ConcurrentHashMap<>();
     private final ScheduledExecutorService scheduler;
 

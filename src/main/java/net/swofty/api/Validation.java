@@ -7,7 +7,7 @@ import net.swofty.validation.ValidationException;
 import net.swofty.validation.ValidationResult;
 import net.swofty.validation.Validator;
 
-public final class Validation {
+final class Validation {
     private Validation() {}
 
     @SuppressWarnings("unchecked")

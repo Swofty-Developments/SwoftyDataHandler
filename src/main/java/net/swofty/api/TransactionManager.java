@@ -13,7 +13,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.UnaryOperator;
 
-public class TransactionManager {
+class TransactionManager {
     private static final DistributedLock.Handle NO_OP = () -> {};
 
     private final PlayerDataManager playerData;

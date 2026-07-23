@@ -5,7 +5,7 @@ import net.swofty.LinkType;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
-public class LinkRegistryImpl {
+class LinkRegistryImpl {
     private final ConcurrentHashMap<UUID, Map<String, Object>> playerLinks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Set<UUID>> reverseIndex = new ConcurrentHashMap<>();
 

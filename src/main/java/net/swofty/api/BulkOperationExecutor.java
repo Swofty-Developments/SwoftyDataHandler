@@ -9,7 +9,7 @@ import java.util.*;
 import java.util.function.Predicate;
 import java.util.function.UnaryOperator;
 
-public class BulkOperationExecutor {
+class BulkOperationExecutor {
     private final PlayerDataManager playerData;
     private final LinkedDataManager linkedData;
     private final DataStorage storage;

@@ -19,7 +19,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * makes a partial write safe: previously an untouched field would be silently
  * dropped the first time any other field was persisted.
  */
-public class DataContainer {
+class DataContainer {
     private final ConcurrentHashMap<String, Object> data = new ConcurrentHashMap<>();
 
     // Fields explicitly cleared (set to null) this session. Suppressed from the merged

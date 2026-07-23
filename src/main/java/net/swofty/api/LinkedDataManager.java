@@ -11,7 +11,7 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.UnaryOperator;
 
-public class LinkedDataManager {
+class LinkedDataManager {
     private final DataStorage storage;
     private final DataFormat format;
     private final EventBus eventBus;
