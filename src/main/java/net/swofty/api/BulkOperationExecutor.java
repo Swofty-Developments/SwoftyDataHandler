@@ -3,6 +3,7 @@ package net.swofty.api;
 import net.swofty.*;
 import net.swofty.event.EventBus;
 import net.swofty.storage.DataStorage;
+import net.swofty.storage.LeaderboardIndex;
 
 import java.util.*;
 import java.util.function.Predicate;
@@ -23,7 +24,32 @@ public class BulkOperationExecutor {
     }
 
     public <T extends Comparable<T>> List<LeaderboardEntry<T>> getTop(PlayerField<T> field, int limit) {
+        LeaderboardIndex index = indexFor(field);
+        if (index != null) {
+            return fromIndex(field, index, 0, limit - 1);
+        }
         return getTop(field, limit, Comparator.reverseOrder());
+    }
+
+    // The sorted index only exists when the backend maintains one AND the field is tracked;
+    // otherwise we fall back to the scan below, so this is purely an accelerator.
+    private LeaderboardIndex indexFor(PlayerField<?> field) {
+        if (storage instanceof LeaderboardIndex index && playerData.isLeaderboardTracked(field.fullKey())) {
+            return index;
+        }
+        return null;
+    }
+
+    private <T> List<LeaderboardEntry<T>> fromIndex(PlayerField<T> field, LeaderboardIndex index,
+                                                    int start, int endInclusive) {
+        List<LeaderboardIndex.ScoreEntry> range = index.scoreRange(field.fullKey(), start, endInclusive, true);
+        List<LeaderboardEntry<T>> result = new ArrayList<>(range.size());
+        int rank = start + 1;
+        for (LeaderboardIndex.ScoreEntry entry : range) {
+            UUID id = UUID.fromString(entry.id());
+            result.add(new LeaderboardEntry<>(id, playerData.getFieldValue(id, field), rank++));
+        }
+        return result;
     }
 
     public <T> List<LeaderboardEntry<T>> getTop(PlayerField<T> field, int limit, Comparator<T> comparator) {
@@ -38,6 +64,14 @@ public class BulkOperationExecutor {
     }
 
     public <T extends Comparable<T>> Page<LeaderboardEntry<T>> getTopPaged(PlayerField<T> field, int page, int pageSize) {
+        LeaderboardIndex index = indexFor(field);
+        if (index != null) {
+            long total = index.leaderboardSize(field.fullKey());
+            int totalPages = (int) Math.ceil((double) total / pageSize);
+            int start = (page - 1) * pageSize;
+            List<LeaderboardEntry<T>> content = fromIndex(field, index, start, start + pageSize - 1);
+            return new Page<>(content, page, totalPages, total);
+        }
         List<Map.Entry<UUID, T>> entries = getAllPlayerValues(field);
         entries.sort((a, b) -> b.getValue().compareTo(a.getValue()));
 

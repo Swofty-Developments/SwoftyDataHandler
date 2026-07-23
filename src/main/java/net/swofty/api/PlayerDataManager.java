@@ -6,9 +6,11 @@ import net.swofty.PlayerField;
 import net.swofty.data.DataFormat;
 import net.swofty.event.EventBus;
 import net.swofty.storage.DataStorage;
+import net.swofty.storage.LeaderboardIndex;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.ToDoubleFunction;
 import java.util.function.UnaryOperator;
 
 public class PlayerDataManager {
@@ -17,7 +19,10 @@ public class PlayerDataManager {
     private final EventBus eventBus;
     private final ConcurrentHashMap<UUID, DataContainer> cache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<UUID, Object> locks = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, TrackedLeaderboard<?>> tracked = new ConcurrentHashMap<>();
     private final boolean autoPersist;
+
+    private record TrackedLeaderboard<T>(PlayerField<T> field, ToDoubleFunction<T> scorer) {}
 
     public PlayerDataManager(DataStorage storage, DataFormat format, EventBus eventBus) {
         this(storage, format, eventBus, true);
@@ -99,6 +104,48 @@ public class PlayerDataManager {
             byte[] bytes = container.serialize(format);
             storage.save("players", player.toString(), bytes);
             container.markPersisted(bytes);
+            updateLeaderboards(player, container);
+        }
+    }
+
+    // ---- Leaderboard indexing ----------------------------------------------
+
+    private LeaderboardIndex leaderboardIndex() {
+        return storage instanceof LeaderboardIndex index ? index : null;
+    }
+
+    boolean isLeaderboardTracked(String fullKey) {
+        return tracked.containsKey(fullKey);
+    }
+
+    public <T> void trackLeaderboard(PlayerField<T> field, ToDoubleFunction<T> scorer) {
+        tracked.put(field.fullKey(), new TrackedLeaderboard<>(field, scorer));
+    }
+
+    private void updateLeaderboards(UUID player, DataContainer container) {
+        LeaderboardIndex index = leaderboardIndex();
+        if (index == null || tracked.isEmpty()) return;
+        for (TrackedLeaderboard<?> t : tracked.values()) {
+            // Only index a field once it is materialised this session, so we never write a
+            // default score over a real one for a field that was never touched.
+            if (container.has(t.field().fullKey())) {
+                index.updateScore(t.field().fullKey(), player.toString(), score(t, container));
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private <T> double score(TrackedLeaderboard<T> t, DataContainer container) {
+        return t.scorer().applyAsDouble((T) container.get(t.field()));
+    }
+
+    /** Backfills the index for a tracked field by scanning existing stored players once. */
+    public <T> void rebuildLeaderboard(PlayerField<T> field, ToDoubleFunction<T> scorer) {
+        LeaderboardIndex index = leaderboardIndex();
+        if (index == null) return;
+        for (String id : storage.listIds("players")) {
+            UUID player = UUID.fromString(id);
+            index.updateScore(field.fullKey(), id, scorer.applyAsDouble(getFieldValue(player, field)));
         }
     }
 

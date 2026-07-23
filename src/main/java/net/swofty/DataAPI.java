@@ -9,6 +9,7 @@ import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.function.Predicate;
+import java.util.function.ToDoubleFunction;
 import java.util.function.UnaryOperator;
 
 public interface DataAPI {
@@ -71,6 +72,12 @@ public interface DataAPI {
     // Bulk operations - Linked
     <K, T extends Comparable<T>> List<LeaderboardEntry<T>> getTopLinked(LinkedField<K, T> field, int limit);
     <K, T> List<K> queryLinked(LinkedField<K, T> field, Predicate<T> filter);
+
+    // Leaderboard indexing - when the storage backend maintains sorted indexes (e.g. Redis
+    // sorted sets), track a field so getTop/getTopPaged read a ranked slice instead of scanning
+    // every stored player. rebuildLeaderboard backfills the index from existing data once.
+    <T> void trackLeaderboard(PlayerField<T> field, ToDoubleFunction<T> scorer);
+    <T> void rebuildLeaderboard(PlayerField<T> field, ToDoubleFunction<T> scorer);
 
     // Lifecycle - warm a player's data into this node before use, evict it when done.
     // This is the primitive a proxy uses to load a player's data on the target server

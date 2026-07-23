@@ -14,6 +14,7 @@ import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.function.Predicate;
+import java.util.function.ToDoubleFunction;
 import java.util.function.UnaryOperator;
 
 public class DataAPIImpl implements DataAPI {
@@ -302,6 +303,16 @@ public class DataAPIImpl implements DataAPI {
     @Override
     public <K, T> List<K> queryLinked(LinkedField<K, T> field, Predicate<T> filter) {
         return bulkOperations.queryLinked(field, filter);
+    }
+
+    @Override
+    public <T> void trackLeaderboard(PlayerField<T> field, ToDoubleFunction<T> scorer) {
+        playerData.trackLeaderboard(field, scorer);
+    }
+
+    @Override
+    public <T> void rebuildLeaderboard(PlayerField<T> field, ToDoubleFunction<T> scorer) {
+        playerData.rebuildLeaderboard(field, scorer);
     }
 
     // ==================== Lifecycle ====================

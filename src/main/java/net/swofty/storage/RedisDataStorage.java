@@ -3,12 +3,13 @@ package net.swofty.storage;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
+import redis.clients.jedis.resps.Tuple;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 
-public class RedisDataStorage implements DataStorage {
+public class RedisDataStorage implements DataStorage, LeaderboardIndex {
     private final JedisPool pool;
     private final String prefix;
 
@@ -67,6 +68,48 @@ public class RedisDataStorage implements DataStorage {
     public boolean exists(String type, String id) {
         try (Jedis jedis = pool.getResource()) {
             return jedis.exists(dataKey(type, id));
+        }
+    }
+
+    // ---- LeaderboardIndex (Redis sorted sets) -------------------------------
+
+    private String leaderboardKey(String leaderboard) {
+        return prefix + ":lb:" + leaderboard;
+    }
+
+    @Override
+    public void updateScore(String leaderboard, String id, double score) {
+        try (Jedis jedis = pool.getResource()) {
+            jedis.zadd(leaderboardKey(leaderboard), score, id);
+        }
+    }
+
+    @Override
+    public void removeFromLeaderboard(String leaderboard, String id) {
+        try (Jedis jedis = pool.getResource()) {
+            jedis.zrem(leaderboardKey(leaderboard), id);
+        }
+    }
+
+    @Override
+    public List<ScoreEntry> scoreRange(String leaderboard, int start, int endInclusive, boolean descending) {
+        String key = leaderboardKey(leaderboard);
+        try (Jedis jedis = pool.getResource()) {
+            List<Tuple> tuples = descending
+                    ? jedis.zrevrangeWithScores(key, start, endInclusive)
+                    : jedis.zrangeWithScores(key, start, endInclusive);
+            List<ScoreEntry> result = new ArrayList<>(tuples.size());
+            for (Tuple tuple : tuples) {
+                result.add(new ScoreEntry(tuple.getElement(), tuple.getScore()));
+            }
+            return result;
+        }
+    }
+
+    @Override
+    public long leaderboardSize(String leaderboard) {
+        try (Jedis jedis = pool.getResource()) {
+            return jedis.zcard(leaderboardKey(leaderboard));
         }
     }
 
