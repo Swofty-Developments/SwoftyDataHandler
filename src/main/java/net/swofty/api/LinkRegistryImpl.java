@@ -9,6 +9,21 @@ class LinkRegistryImpl {
     private final ConcurrentHashMap<UUID, Map<String, Object>> playerLinks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Set<UUID>> reverseIndex = new ConcurrentHashMap<>();
 
+    private volatile LinkKeyLoader keyLoader;
+
+    /**
+     * Reads a player's persisted link key. The registry is per-node and in-memory, so a node that
+     * never ran {@code link()} for a player (a fresh process, or one the player just moved to) has
+     * no entry for them; this is what lets it recover the link from stored data instead.
+     */
+    interface LinkKeyLoader {
+        <K> K load(UUID player, LinkType<K> type);
+    }
+
+    void setKeyLoader(LinkKeyLoader keyLoader) {
+        this.keyLoader = keyLoader;
+    }
+
     public <K> void link(UUID player, LinkType<K> type, K key) {
         playerLinks.computeIfAbsent(player, k -> new ConcurrentHashMap<>())
                 .put(type.name(), key);
@@ -38,17 +53,26 @@ class LinkRegistryImpl {
     @SuppressWarnings("unchecked")
     public <K> K resolve(UUID player, LinkType<K> type) {
         Map<String, Object> links = playerLinks.get(player);
-        return links == null ? null : (K) links.get(type.name());
+        K key = links == null ? null : (K) links.get(type.name());
+        return key != null ? key : rehydrate(player, type);
     }
 
-    @SuppressWarnings("unchecked")
     public <K> Optional<K> getLinkKey(UUID player, LinkType<K> type) {
-        Map<String, Object> links = playerLinks.get(player);
-        if (links == null) return Optional.empty();
-        return Optional.ofNullable((K) links.get(type.name()));
+        return Optional.ofNullable(resolve(player, type));
     }
 
-    @SuppressWarnings("unchecked")
+    // Recovers a link this node never saw from the player's stored link-key field, then caches it
+    // so later lookups (and the reverse index) behave exactly as if link() had run here.
+    private <K> K rehydrate(UUID player, LinkType<K> type) {
+        LinkKeyLoader loader = this.keyLoader;
+        if (loader == null) return null;
+        K key = loader.load(player, type);
+        if (key != null) {
+            link(player, type, key);
+        }
+        return key;
+    }
+
     Object resolve(UUID player, String linkTypeName) {
         Map<String, Object> links = playerLinks.get(player);
         return links == null ? null : links.get(linkTypeName);

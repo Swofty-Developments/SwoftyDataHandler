@@ -50,6 +50,9 @@ public class DataAPIImpl implements DataAPI {
         this.eventBus = (pubSub != null) ? new DistributedEventBus(pubSub) : new EventBus();
         this.linkRegistry = new LinkRegistryImpl();
         this.playerData = new PlayerDataManager(storage, format, eventBus, autoPersist);
+        // Links live in shared storage on the player's own document, so a node that never linked
+        // the player itself can still recover the key instead of behaving as if they had no link.
+        this.linkRegistry.setKeyLoader(playerData::loadLinkKey);
         this.linkedData = new LinkedDataManager(storage, format, eventBus, linkRegistry, autoPersist);
         this.expirationManager = new ExpirationManager();
         this.transactionManager = new TransactionManager(playerData, linkedData, linkRegistry, eventBus,
@@ -67,6 +70,18 @@ public class DataAPIImpl implements DataAPI {
                 @Override
                 public <T> void onLinkedChange(DataField<T> field, String linkTypeName, String linkKey, T newValue) {
                     linkedData.applyRemote(linkTypeName, linkKey, field, newValue);
+                }
+
+                @Override
+                public <K> void onLinked(LinkType<K> type, UUID player, K linkKey) {
+                    linkRegistry.link(player, type, linkKey);
+                    playerData.applyRemote(type.playerField(), player, linkKey);
+                }
+
+                @Override
+                public <K> void onUnlinked(LinkType<K> type, UUID player, K previousKey) {
+                    linkRegistry.unlink(player, type);
+                    playerData.applyRemote(type.playerField(), player, null);
                 }
             });
         }

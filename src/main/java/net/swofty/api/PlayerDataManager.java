@@ -2,6 +2,7 @@ package net.swofty.api;
 
 import net.swofty.DataField;
 import net.swofty.ExpiringField;
+import net.swofty.LinkType;
 import net.swofty.PlayerField;
 import net.swofty.data.DataFormat;
 import net.swofty.event.EventBus;
@@ -15,6 +16,8 @@ import java.util.function.UnaryOperator;
 
 // Internal to net.swofty.api — reach it through DataAPI / DataAPIImpl, not directly.
 class PlayerDataManager {
+    private static final System.Logger LOGGER = System.getLogger(PlayerDataManager.class.getName());
+
     private final DataStorage storage;
     private final DataFormat format;
     private final EventBus eventBus;
@@ -241,6 +244,27 @@ class PlayerDataManager {
             container = cache.get(player);
             if (container == null) return;
             container.applyRemote(field, newValue, format);
+        }
+    }
+
+    /**
+     * Reads a player's stored link key straight out of their document, so a node that never ran
+     * {@code link()} itself can still resolve the link. The key is decoded with the link type's key
+     * codec, which is how {@code link()} stored it; a document that predates the field, or whose
+     * value cannot be decoded, resolves to no link rather than failing the read.
+     */
+    <K> K loadLinkKey(UUID player, LinkType<K> type) {
+        PlayerField<K> playerField = type.playerField();
+        if (playerField == null) return null;
+        DataField<K> ref = new SimpleFieldRef<>(playerField.fullKey(), type.keyCodec());
+        try {
+            synchronized (getLock(player)) {
+                return getFieldValue(player, ref);
+            }
+        } catch (RuntimeException e) {
+            LOGGER.log(System.Logger.Level.WARNING,
+                    "Could not read link key for " + type.name() + " from player " + player, e);
+            return null;
         }
     }
 

@@ -212,6 +212,10 @@ public class DistributedEventBus extends EventBus {
         if (type == null) return;
         UUID player = UUID.fromString((String) msg.data.get("player"));
         Object linkKey = deserializeValue(type.keyCodec(), msg.data.get("linkKey"));
+        RemoteChangeHandler handler = remoteChangeHandler;
+        if (handler != null && linkKey != null) {
+            handler.onLinked(type, player, linkKey);
+        }
         super.fireLinked(type, player, linkKey);
     }
 
@@ -221,6 +225,10 @@ public class DistributedEventBus extends EventBus {
         if (type == null) return;
         UUID player = UUID.fromString((String) msg.data.get("player"));
         Object previousKey = deserializeValue(type.keyCodec(), msg.data.get("previousKey"));
+        RemoteChangeHandler handler = remoteChangeHandler;
+        if (handler != null) {
+            handler.onUnlinked(type, player, previousKey);
+        }
         super.fireUnlinked(type, player, previousKey);
     }
 

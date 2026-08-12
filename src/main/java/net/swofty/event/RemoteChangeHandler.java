@@ -1,6 +1,7 @@
 package net.swofty.event;
 
 import net.swofty.DataField;
+import net.swofty.LinkType;
 
 import java.util.UUID;
 
@@ -14,4 +15,10 @@ public interface RemoteChangeHandler {
     <T> void onPlayerChange(DataField<T> field, UUID player, T newValue);
 
     <T> void onLinkedChange(DataField<T> field, String linkTypeName, String linkKey, T newValue);
+
+    /** A player was linked on another node, so this node's link state can converge on it. */
+    default <K> void onLinked(LinkType<K> type, UUID player, K linkKey) {}
+
+    /** A player was unlinked on another node. */
+    default <K> void onUnlinked(LinkType<K> type, UUID player, K previousKey) {}
 }

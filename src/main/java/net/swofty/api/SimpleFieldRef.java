@@ -4,14 +4,17 @@ import net.swofty.DataField;
 import net.swofty.codec.Codec;
 
 /**
- * Minimal DataField implementation used internally by TransactionManager
- * to set values by fullKey without needing the original field reference.
+ * Minimal DataField implementation used internally to read or write a value by fullKey
+ * when the original field reference is not at hand — e.g. reading a player's stored link
+ * key with the link type's key codec rather than the declared field codec.
  */
-class SimpleFieldRef implements DataField<Object> {
+class SimpleFieldRef<T> implements DataField<T> {
     private final String fullKey;
+    private final Codec<T> codec;
 
-    SimpleFieldRef(String fullKey) {
+    SimpleFieldRef(String fullKey, Codec<T> codec) {
         this.fullKey = fullKey;
+        this.codec = codec;
     }
 
     @Override
@@ -32,12 +35,12 @@ class SimpleFieldRef implements DataField<Object> {
     }
 
     @Override
-    public Codec<Object> codec() {
-        return null; // Not used for direct container writes
+    public Codec<T> codec() {
+        return codec;
     }
 
     @Override
-    public Object defaultValue() {
+    public T defaultValue() {
         return null;
     }
 }
