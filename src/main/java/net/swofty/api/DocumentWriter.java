@@ -16,59 +16,50 @@ import java.util.concurrent.ThreadLocalRandom;
  * and a lost race is not an error — the container rebases its pending writes onto the winner's
  * document and tries again, so both fields survive.
  *
- * <p>Retries are bounded. A document under permanent contention resolves as last-writer-wins with a
- * warning rather than spinning, because blocking a game thread forever is worse than losing a write
- * loudly.
+ * <p>Every write goes through that comparison, without exception. There is no give-up path that
+ * overwrites the document unconditionally: whatever a peer wrote between this node's last reread and
+ * its write would be erased wholesale, which is precisely the bug the comparison exists to prevent,
+ * and it is worst exactly when contention is highest. The loop is unbounded because it does not need
+ * a bound — every conflict means some other writer committed, so the system as a whole always makes
+ * progress, and this node cannot spin unless work is actually being done to the document. It backs
+ * off with jitter and complains at WARNING if it keeps losing.
  */
 final class DocumentWriter {
     private static final System.Logger LOGGER = System.getLogger(DocumentWriter.class.getName());
-    private static final int MAX_ATTEMPTS = 8;
-    private static final int MAX_BACKOFF_MILLIS = 8;
+    private static final int MAX_BACKOFF_MILLIS = 250;
+    private static final int CONFLICTS_PER_WARNING = 16;
 
     private DocumentWriter() {}
 
     static SaveResult write(DataStorage storage, DataFormat format, String type, String id,
                             DataContainer container) {
-        for (int attempt = 1; ; attempt++) {
+        for (int conflicts = 0; ; conflicts++) {
             byte[] bytes = container.serialize(format);
             SaveResult result = storage.saveIfVersion(type, id, bytes, container.documentVersion());
             if (!result.conflict()) {
                 container.markPersisted(bytes, result.version());
                 return result;
             }
+            if (conflicts > 0 && conflicts % CONFLICTS_PER_WARNING == 0) {
+                LOGGER.log(System.Logger.Level.WARNING, "Still merging " + type + "/" + id + " after "
+                        + conflicts + " version conflicts; this document is under heavy contention");
+            }
+            backOff(conflicts);
+            // Reread last, so the document this node rebases onto is as fresh as the backoff allows.
             VersionedData fresh = storage.loadVersioned(type, id);
             container.rebase(fresh.data(), fresh.version());
-            if (attempt >= MAX_ATTEMPTS) {
-                return overwrite(storage, format, type, id, container, attempt);
-            }
-            backOff(attempt);
         }
     }
 
     // Two nodes writing the same document in a loop spend most of each attempt serialising, so they
-    // collide again and again in lockstep without this. A short randomised pause is what breaks the
+    // collide again and again in lockstep without this. A randomised pause is what breaks the
     // symmetry and lets both of them land.
-    private static void backOff(int attempt) {
-        long millis = Math.min(MAX_BACKOFF_MILLIS, 1L << (attempt - 1));
+    private static void backOff(int conflicts) {
+        long ceiling = Math.min(MAX_BACKOFF_MILLIS, 1L << Math.min(conflicts, 10));
         try {
-            Thread.sleep(ThreadLocalRandom.current().nextLong(1, millis + 1));
+            Thread.sleep(ThreadLocalRandom.current().nextLong(1, ceiling + 1));
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
         }
-    }
-
-    private static SaveResult overwrite(DataStorage storage, DataFormat format, String type, String id,
-                                        DataContainer container, int attempts) {
-        LOGGER.log(System.Logger.Level.WARNING,
-                "Gave up merging " + type + "/" + id + " after " + attempts
-                        + " version conflicts; overwriting whatever is stored with this node's view");
-        // Overwriting through the same conditional call, with the comparison waived, so the
-        // version comes back from the write itself. Writing and then reading the version back would
-        // pick up a version another node produced in between, and the container would then believe
-        // it holds a document it has never seen.
-        byte[] bytes = container.serialize(format);
-        SaveResult result = storage.saveIfVersion(type, id, bytes, VersionedData.ANY_VERSION);
-        container.markPersisted(bytes, result.version());
-        return result;
     }
 }

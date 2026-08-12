@@ -51,8 +51,7 @@ public class RedisDataStorage implements DataStorage, LeaderboardIndex {
     // The compare and the write happen inside the same script, which is what makes this a real
     // compare-and-set rather than a check followed by a hopeful write.
     private static final byte[] SAVE_IF_VERSION_SCRIPT = ("local stored=tonumber(redis.call('get',KEYS[2]) or '0');"
-            + "local expected=tonumber(ARGV[3]);"
-            + "if expected >= 0 and stored ~= expected then return {0,stored} end;"
+            + "if stored ~= tonumber(ARGV[3]) then return {0,stored} end;"
             + "local updated=redis.call('incr',KEYS[2]);"
             + "redis.call('set',KEYS[1],ARGV[1]);redis.call('sadd',KEYS[3],ARGV[2]);return {1,updated}")
             .getBytes(StandardCharsets.UTF_8);

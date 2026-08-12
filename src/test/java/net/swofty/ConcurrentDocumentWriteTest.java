@@ -6,6 +6,7 @@ import net.swofty.storage.InMemoryDataStorage;
 import net.swofty.storage.SaveResult;
 import net.swofty.storage.VersionedData;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -85,41 +86,97 @@ class ConcurrentDocumentWriteTest {
         }
     }
 
-    @Test
-    void aDocumentUnderPermanentConflictFallsBackToLastWriterWinsAndSaysSo() {
-        class AlwaysConflicting extends InMemoryDataStorage {
-            final AtomicInteger conditionalWrites = new AtomicInteger();
-            final AtomicInteger overwrites = new AtomicInteger();
+    /** Lets a peer's write land at a chosen point inside another node's retry loop. */
+    private static final class InterleavingStorage extends InMemoryDataStorage {
+        final AtomicInteger conditionalWrites = new AtomicInteger();
+        private volatile int conflictsToForce;
+        private volatile int rereadsBeforeHook = -1;
+        private volatile Runnable hook;
 
-            @Override
-            public SaveResult saveIfVersion(String type, String id, byte[] data, long expectedVersion) {
-                if (expectedVersion == VersionedData.ANY_VERSION) {
-                    overwrites.incrementAndGet();
-                    return super.saveIfVersion(type, id, data, expectedVersion);
-                }
-                conditionalWrites.incrementAndGet();
-                return SaveResult.conflict(type, id, expectedVersion + 1);
-            }
+        void forceConflicts(int count) {
+            conflictsToForce = count;
         }
 
-        AlwaysConflicting storage = new AlwaysConflicting();
+        /** Runs {@code action} after the Nth reread returns, i.e. between a reread and the write. */
+        void afterReread(int reread, Runnable action) {
+            rereadsBeforeHook = reread;
+            hook = action;
+        }
+
+        @Override
+        public VersionedData loadVersioned(String type, String id) {
+            VersionedData loaded = super.loadVersioned(type, id);
+            if (rereadsBeforeHook > 0 && --rereadsBeforeHook == 0) {
+                Runnable action = hook;
+                hook = null;
+                if (action != null) action.run();
+            }
+            return loaded;
+        }
+
+        @Override
+        public SaveResult saveIfVersion(String type, String id, byte[] data, long expectedVersion) {
+            conditionalWrites.incrementAndGet();
+            if (conflictsToForce > 0) {
+                conflictsToForce--;
+                return SaveResult.conflict(type, id, super.loadVersioned(type, id).version());
+            }
+            return super.saveIfVersion(type, id, data, expectedVersion);
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    void aPeersWriteIsNotErasedByANodeThatHasBeenLosingRaces() {
+        InterleavingStorage storage = new InterleavingStorage();
         CapturedLog log = CapturedLog.attachTo("net.swofty.api.DocumentWriter");
+        DataAPI a = new DataAPIImpl(storage);
+        DataAPI b = new DataAPIImpl(storage);
+        UUID player = UUID.randomUUID();
+        try {
+            a.load(player);
+            b.load(player);
+            b.set(player, NAME, "peer-1");
+
+            // Node A loses twenty races, and on the last reread before it finally writes, the peer
+            // lands another write to a different field. Giving up and overwriting at any point here
+            // erases that field - which is exactly the failure the comparison exists to prevent, and
+            // it is likeliest precisely when contention has been high enough to make a node give up.
+            storage.forceConflicts(20);
+            storage.afterReread(20, () -> b.set(player, NAME, "peer-2"));
+            a.set(player, COINS, 42);
+
+            assertTrue(storage.conditionalWrites.get() > 20,
+                    "the write must keep retrying rather than stopping at a threshold");
+            assertTrue(log.warned(), "sustained contention must be visible in the log");
+
+            try (DataAPI fresh = new DataAPIImpl(storage)) {
+                assertEquals(42, fresh.get(player, COINS));
+                assertEquals("peer-2", fresh.get(player, NAME), "the peer's write was overwritten");
+            }
+        } finally {
+            a.shutdown();
+            b.shutdown();
+            log.detach();
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    void aWriteThatKeepsLosingEventuallyLandsWithoutOverwritingAnything() {
+        InterleavingStorage storage = new InterleavingStorage();
         DataAPI api = new DataAPIImpl(storage);
         UUID player = UUID.randomUUID();
         try {
+            storage.forceConflicts(40);
             api.set(player, COINS, 7);
 
-            // Bounded: it gives up rather than spinning on a document it can never win.
-            assertEquals(8, storage.conditionalWrites.get());
-            assertEquals(1, storage.overwrites.get());
-            assertTrue(log.warned(), "giving up on a merge must be logged, not silent");
-
+            assertEquals(41, storage.conditionalWrites.get());
             try (DataAPI fresh = new DataAPIImpl(storage)) {
                 assertEquals(7, fresh.get(player, COINS));
             }
         } finally {
             api.shutdown();
-            log.detach();
         }
     }
 

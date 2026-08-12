@@ -50,11 +50,6 @@ public class MongoDataStorage implements DataStorage {
 
     @Override
     public SaveResult saveIfVersion(String type, String id, byte[] data, long expectedVersion) {
-        if (expectedVersion == VersionedData.ANY_VERSION) {
-            Document overwritten = collection(type).findOneAndUpdate(Filters.eq("_id", id), writeAndBump(data),
-                    versionOnly().upsert(true));
-            return SaveResult.saved(type, id, overwritten == null ? 1L : versionOf(overwritten));
-        }
         Bson filter = expectedVersion == VersionedData.UNVERSIONED
                 // A document that predates versioning, or one that does not exist yet, is version 0.
                 ? Filters.and(Filters.eq("_id", id),

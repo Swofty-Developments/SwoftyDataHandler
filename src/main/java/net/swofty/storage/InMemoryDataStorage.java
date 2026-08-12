@@ -39,9 +39,7 @@ public class InMemoryDataStorage implements DataStorage, LeaderboardIndex {
         AtomicLong version = version(type, id);
         synchronized (version) {
             long current = version.get();
-            if (expectedVersion != VersionedData.ANY_VERSION && current != expectedVersion) {
-                return SaveResult.conflict(type, id, current);
-            }
+            if (current != expectedVersion) return SaveResult.conflict(type, id, current);
             store(type, id, bytes);
             return SaveResult.saved(type, id, version.incrementAndGet());
         }

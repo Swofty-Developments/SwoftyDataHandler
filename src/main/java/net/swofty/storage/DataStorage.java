@@ -24,10 +24,6 @@ public interface DataStorage extends AutoCloseable {
      * Writes the document only if the stored version is still {@code expectedVersion}, atomically
      * within the backend, and reports the version the write produced.
      *
-     * <p>{@link VersionedData#ANY_VERSION} skips the comparison and overwrites, which is how a
-     * caller that has given up on merging still learns the version its write produced — reading the
-     * version back afterwards would be a different, racier answer.
-     *
      * <p>A backend that cannot do the comparison atomically must not pretend otherwise: leaving
      * this defaulted is the honest answer and callers degrade to last-writer-wins rather than to
      * silent corruption.

@@ -52,9 +52,7 @@ public class FileDataStorage implements DataStorage {
     @Override
     public synchronized SaveResult saveIfVersion(String type, String id, byte[] data, long expectedVersion) {
         long current = readVersion(type, id);
-        if (expectedVersion != VersionedData.ANY_VERSION && current != expectedVersion) {
-            return SaveResult.conflict(type, id, current);
-        }
+        if (current != expectedVersion) return SaveResult.conflict(type, id, current);
         long version = current + 1;
         write(type, id, data, version);
         return SaveResult.saved(type, id, version);
