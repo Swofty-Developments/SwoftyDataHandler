@@ -80,7 +80,7 @@ public class DataAPIImpl implements DataAPI {
         this.linkedData = new LinkedDataManager(storage, format, eventBus, linkRegistry, autoPersist);
         this.expirationManager = new ExpirationManager(eventBus);
         this.transactionManager = new TransactionManager(playerData, linkedData, linkRegistry, eventBus,
-                distributedLock, lockTimeout);
+                distributedLock, lockTimeout, this);
         this.bulkOperations = new BulkOperationExecutor(playerData, linkedData, storage, eventBus);
 
         // Keep locally cached containers coherent with changes made on other nodes.
@@ -120,6 +120,16 @@ public class DataAPIImpl implements DataAPI {
                 @Override
                 public void onLinkedSnapshot(String linkTypeName, String linkKey, long version) {
                     linkedData.applyRemoteSnapshot(linkTypeName, linkKey, version);
+                }
+
+                @Override
+                public boolean isPlayerCached(UUID player) {
+                    return playerData.isLoaded(player);
+                }
+
+                @Override
+                public boolean isLinkedCached(String linkTypeName, String linkKey) {
+                    return linkedData.isLinkedLoaded(linkTypeName, linkKey);
                 }
 
                 @Override
@@ -245,26 +255,30 @@ public class DataAPIImpl implements DataAPI {
      */
     private void underEntityLock(String lockKey, Object monitor, Runnable refresh, Supplier<SaveResult> write) {
         requireDistributedLock();
-        if (LockScope.holds(lockKey)) {
+        if (LockScope.holdsKey(distributedLock, lockKey)) {
             synchronized (monitor) {
+                // Riding a lock this thread already holds. The reread is skipped only when this same
+                // API took it: another DataAPIImpl sharing this lock generates the same key for the
+                // same player, but it reread its own document, not this one's.
+                if (!LockScope.holdsKeyForOwner(distributedLock, lockKey, this)) refresh.run();
                 write.get();
             }
             return;
         }
-        if (LockScope.holdsAnything()) {
+        if (LockScope.holdsOtherKey(distributedLock, lockKey)) {
             throw new IllegalStateException("Cannot take the distributed lock for " + lockKey
-                    + " while this thread holds " + LockScope.describeHeld()
+                    + " while this thread holds " + LockScope.describeHeld(distributedLock)
                     + "; use lock(key, timeout) explicitly if you need more than one entity");
         }
         try (DistributedLock.Handle handle = distributedLock.acquire(lockKey, lockTimeout)) {
             synchronized (monitor) {
-                LockScope.enter(lockKey);
+                LockScope.enter(distributedLock, lockKey, this);
                 try {
                     refresh.run();
                     write.get();
                     handle.ensureValid();
                 } finally {
-                    LockScope.exit(lockKey);
+                    LockScope.exit(distributedLock, lockKey, this);
                 }
             }
         }

@@ -24,15 +24,29 @@ class TransactionManager {
     private final EventBus eventBus;
     private final DistributedLock distributedLock;
     private final Duration lockTimeout;
+    // The API instance these transactions belong to, recorded with the lock so a write on a
+    // different API sharing the same lock knows it still has to reread its own document.
+    private final Object owner;
 
     public TransactionManager(PlayerDataManager playerData, LinkedDataManager linkedData, LinkRegistryImpl linkRegistry,
-                              EventBus eventBus, DistributedLock distributedLock, Duration lockTimeout) {
+                              EventBus eventBus, DistributedLock distributedLock, Duration lockTimeout, Object owner) {
         this.playerData = playerData;
         this.linkedData = linkedData;
         this.linkRegistry = linkRegistry;
         this.eventBus = eventBus;
         this.distributedLock = distributedLock;
         this.lockTimeout = lockTimeout;
+        this.owner = owner;
+    }
+
+    // Nothing is recorded without a distributed lock: there is no cross-node exclusion for a nested
+    // write to inherit, and claiming otherwise let such a write skip an acquisition it needed.
+    private void enterScope(String lockKey) {
+        if (distributedLock != null) LockScope.enter(distributedLock, lockKey, owner);
+    }
+
+    private void exitScope(String lockKey) {
+        if (distributedLock != null) LockScope.exit(distributedLock, lockKey, owner);
     }
 
     // A pending write, kept with the field it came from so commit can persist it and then fire
@@ -66,7 +80,7 @@ class TransactionManager {
         // that would transparently take the same non-reentrant lock can ride this one instead.
         try (DistributedLock.Handle handle = acquire(lockKey)) {
             synchronized (playerData.getLock(player)) {
-                LockScope.enter(lockKey);
+                enterScope(lockKey);
                 refreshPlayer(player);
                 TransactionContext tx = new TransactionContext(player, null, null);
                 try {
@@ -81,7 +95,7 @@ class TransactionManager {
                     tx.rollback();
                     throw e;
                 } finally {
-                    LockScope.exit(lockKey);
+                    exitScope(lockKey);
                 }
             }
         }
@@ -99,7 +113,7 @@ class TransactionManager {
         String lockKey = "linked:" + ck;
         try (DistributedLock.Handle handle = acquire(lockKey)) {
             synchronized (linkedData.getLock(ck)) {
-                LockScope.enter(lockKey);
+                enterScope(lockKey);
                 refreshLinked(type.name(), key);
                 TransactionContext tx = new TransactionContext(null, type, key);
                 try {
@@ -114,7 +128,7 @@ class TransactionManager {
                     tx.rollback();
                     throw e;
                 } finally {
-                    LockScope.exit(lockKey);
+                    exitScope(lockKey);
                 }
             }
         }

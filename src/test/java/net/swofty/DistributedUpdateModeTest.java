@@ -17,6 +17,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -30,9 +31,11 @@ class DistributedUpdateModeTest {
     /** Behaves like the Redis lock: one holder per key, no matter which thread asks. */
     private static final class NonReentrantLock implements DistributedLock {
         private final ConcurrentHashMap<String, Semaphore> permits = new ConcurrentHashMap<>();
+        final AtomicInteger acquisitions = new AtomicInteger();
 
         @Override
         public Handle acquire(String key, Duration timeout) {
+            acquisitions.incrementAndGet();
             Semaphore permit = permits.computeIfAbsent(key, ignored -> new Semaphore(1));
             try {
                 if (!permit.tryAcquire(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
@@ -143,6 +146,64 @@ class DistributedUpdateModeTest {
             assertTrue(waited.compareTo(SHORT_TIMEOUT) >= 0, "gave up before the configured timeout: " + waited);
             assertTrue(waited.compareTo(Duration.ofSeconds(5)) < 0,
                     "waited far longer than configured, so the timeout is not being used: " + waited);
+        }
+    }
+
+    @Test
+    void aWriteOnAnotherApiSharingTheLockStillRereadsItsOwnDocument() {
+        // The shape HSB runs: two APIs over different namespaces, one shared Redis lock, so both
+        // generate the key "player:<uuid>" for the same player while owning different documents.
+        InMemoryDataStorage accountStorage = new InMemoryDataStorage();
+        InMemoryDataStorage profileStorage = new InMemoryDataStorage();
+        DataAPI accounts = new DataAPIImpl(accountStorage, new JsonFormat(), null, true, lock,
+                StorageOwnership.BORROWED, SHORT_TIMEOUT);
+        DataAPI profiles = new DataAPIImpl(profileStorage, new JsonFormat(), null, true, lock,
+                StorageOwnership.BORROWED, SHORT_TIMEOUT);
+        DataAPI profilesOnAnotherNode = new DataAPIImpl(profileStorage);
+        UUID player = UUID.randomUUID();
+        try {
+            profiles.load(player);
+            assertEquals(0, profiles.get(player, COINS));
+
+            // Another node moves the profile on while this node holds a stale cached copy.
+            profilesOnAnotherNode.set(player, COINS, 989);
+            lock.acquisitions.set(0);
+
+            accounts.transaction(player, tx -> {
+                profiles.update(player, COINS, coins -> coins + 1, UpdateMode.DISTRIBUTED);
+            });
+
+            // One acquisition, because the lock really is the same one and re-taking it would
+            // deadlock. But the account transaction reread the account document, not this one, so
+            // the profile write still has to reread its own or it computes from a stale value.
+            assertEquals(1, lock.acquisitions.get());
+            assertEquals(990, profiles.get(player, COINS));
+            try (DataAPI fresh = new DataAPIImpl(profileStorage)) {
+                assertEquals(990, fresh.get(player, COINS), "the increment was computed from a stale value");
+            }
+        } finally {
+            accounts.shutdown();
+            profiles.shutdown();
+            profilesOnAnotherNode.shutdown();
+        }
+    }
+
+    @Test
+    void aTransactionOnALocklessApiDoesNotStopALockedApiFromTakingTheLock() {
+        DataAPI lockless = new DataAPIImpl(new InMemoryDataStorage());
+        UUID player = UUID.randomUUID();
+        try {
+            lock.acquisitions.set(0);
+
+            lockless.transaction(player, tx -> {
+                api.update(player, COINS, coins -> coins + 1, UpdateMode.DISTRIBUTED);
+            });
+
+            // A transaction with no distributed lock has no cross-node exclusion to lend anyone.
+            assertEquals(1, lock.acquisitions.get());
+            assertEquals(1, api.get(player, COINS));
+        } finally {
+            lockless.shutdown();
         }
     }
 
