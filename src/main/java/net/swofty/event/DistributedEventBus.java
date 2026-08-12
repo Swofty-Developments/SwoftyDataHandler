@@ -82,59 +82,72 @@ public class DistributedEventBus extends EventBus {
     @Override
     public <T> void firePlayerDataChanged(DataField<T> field, UUID player, T oldValue, T newValue) {
         super.firePlayerDataChanged(field, player, oldValue, newValue);
-        publish(new EventMessage("PLAYER_DATA_CHANGED", field.fullKey(), nodeId, Map.of(
-                "player", player.toString(),
-                "oldValue", serializeValue(field.codec(), oldValue),
-                "newValue", serializeValue(field.codec(), newValue)
-        )));
+        Map<String, Object> data = payload();
+        put(data, "player", player.toString());
+        put(data, "oldValue", serializeValue(field.codec(), oldValue));
+        put(data, "newValue", serializeValue(field.codec(), newValue));
+        publish(new EventMessage("PLAYER_DATA_CHANGED", field.fullKey(), nodeId, data));
     }
 
     @Override
     public <K, T> void fireLinkedDataChanged(DataField<T> field, K linkKey, T oldValue, T newValue, Set<UUID> affected) {
         super.fireLinkedDataChanged(field, linkKey, oldValue, newValue, affected);
-        publish(new EventMessage("LINKED_DATA_CHANGED", field.fullKey(), nodeId, Map.of(
-                "linkKey", serializeLinkKey(field, linkKey),
-                "oldValue", serializeValue(field.codec(), oldValue),
-                "newValue", serializeValue(field.codec(), newValue),
-                "affected", uuidSetToList(affected)
-        )));
+        Map<String, Object> data = payload();
+        put(data, "linkKey", serializeLinkKey(field, linkKey));
+        put(data, "oldValue", serializeValue(field.codec(), oldValue));
+        put(data, "newValue", serializeValue(field.codec(), newValue));
+        put(data, "affected", uuidSetToList(affected));
+        publish(new EventMessage("LINKED_DATA_CHANGED", field.fullKey(), nodeId, data));
     }
 
     @Override
     public <K> void fireLinked(LinkType<K> type, UUID player, K linkKey) {
         super.fireLinked(type, player, linkKey);
-        publish(new EventMessage("LINKED", type.name(), nodeId, Map.of(
-                "player", player.toString(),
-                "linkKey", serializeValue(type.keyCodec(), linkKey)
-        )));
+        Map<String, Object> data = payload();
+        put(data, "player", player.toString());
+        put(data, "linkKey", serializeValue(type.keyCodec(), linkKey));
+        publish(new EventMessage("LINKED", type.name(), nodeId, data));
     }
 
     @Override
     public <K> void fireUnlinked(LinkType<K> type, UUID player, K previousKey) {
         super.fireUnlinked(type, player, previousKey);
-        publish(new EventMessage("UNLINKED", type.name(), nodeId, Map.of(
-                "player", player.toString(),
-                "previousKey", serializeValue(type.keyCodec(), previousKey)
-        )));
+        Map<String, Object> data = payload();
+        put(data, "player", player.toString());
+        put(data, "previousKey", serializeValue(type.keyCodec(), previousKey));
+        publish(new EventMessage("UNLINKED", type.name(), nodeId, data));
     }
 
     @Override
     public <T> void fireExpired(ExpiringField<T> field, UUID playerId, T expiredValue) {
         super.fireExpired(field, playerId, expiredValue);
-        publish(new EventMessage("EXPIRED", field.fullKey(), nodeId, Map.of(
-                "player", playerId.toString(),
-                "expiredValue", serializeValue(field.codec(), expiredValue)
-        )));
+        Map<String, Object> data = payload();
+        put(data, "player", playerId.toString());
+        put(data, "expiredValue", serializeValue(field.codec(), expiredValue));
+        publish(new EventMessage("EXPIRED", field.fullKey(), nodeId, data));
     }
 
     @Override
     public <K, T> void fireLinkedExpired(ExpiringLinkedField<K, T> field, K linkKey, T expiredValue, Set<UUID> memberIds) {
         super.fireLinkedExpired(field, linkKey, expiredValue, memberIds);
-        publish(new EventMessage("LINKED_EXPIRED", field.fullKey(), nodeId, Map.of(
-                "linkKey", serializeLinkKey(field, linkKey),
-                "expiredValue", serializeValue(field.codec(), expiredValue),
-                "memberIds", uuidSetToList(memberIds)
-        )));
+        Map<String, Object> data = payload();
+        put(data, "linkKey", serializeLinkKey(field, linkKey));
+        put(data, "expiredValue", serializeValue(field.codec(), expiredValue));
+        put(data, "memberIds", uuidSetToList(memberIds));
+        publish(new EventMessage("LINKED_EXPIRED", field.fullKey(), nodeId, data));
+    }
+
+    // A null-valued field is a legitimate state (an unset nullable field, a cleared link), so
+    // payloads omit it rather than blowing up the write that triggered the event. The receiving
+    // side reads a missing entry back as null.
+    private static Map<String, Object> payload() {
+        return new HashMap<>();
+    }
+
+    private static void put(Map<String, Object> data, String key, Object value) {
+        if (value != null) {
+            data.put(key, value);
+        }
     }
 
     // ==================== Pub/Sub ====================
