@@ -6,9 +6,16 @@ import net.swofty.LinkedField;
 import net.swofty.data.DataFormat;
 import net.swofty.event.EventBus;
 import net.swofty.storage.DataStorage;
+import net.swofty.storage.SaveRequest;
+import net.swofty.storage.SaveResult;
+import net.swofty.storage.StorageKey;
+import net.swofty.storage.VersionedData;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.Executor;
 import java.util.function.UnaryOperator;
 
 class LinkedDataManager {
@@ -17,7 +24,7 @@ class LinkedDataManager {
     private final EventBus eventBus;
     private final LinkRegistryImpl linkRegistry;
     private final ConcurrentHashMap<String, DataContainer> cache = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, Object> locks = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, EntitySession> sessions = new ConcurrentHashMap<>();
     private final boolean autoPersist;
 
     public LinkedDataManager(DataStorage storage, DataFormat format, EventBus eventBus, LinkRegistryImpl linkRegistry) {
@@ -34,7 +41,7 @@ class LinkedDataManager {
     }
 
     Object getLock(String compositeKey) {
-        return locks.computeIfAbsent(compositeKey, k -> new Object());
+        return sessions.computeIfAbsent(compositeKey, ignored -> new EntitySession());
     }
 
     static String compositeKey(String linkTypeName, Object key) {
@@ -70,42 +77,44 @@ class LinkedDataManager {
         }
     }
 
-    public <K, T> void set(UUID player, LinkedField<K, T> field, T value) {
+    public <K, T> SaveResult set(UUID player, LinkedField<K, T> field, T value) {
         K linkKey = linkRegistry.resolve(player, field.linkType());
         if (linkKey == null) {
             throw new IllegalStateException("Player " + player + " is not linked to " + field.linkType().name());
         }
-        setDirect(linkKey, field, value);
+        return setDirect(linkKey, field, value);
     }
 
-    public <K, T> void setDirect(K key, LinkedField<K, T> field, T value) {
+    public <K, T> SaveResult setDirect(K key, LinkedField<K, T> field, T value) {
         Validation.validate(field, value);
         String ck = compositeKey(field.linkType().name(), key);
         synchronized (getLock(ck)) {
             T oldValue = getFieldValue(field.linkType().name(), key, field);
-            setFieldValue(field.linkType().name(), key, field, value);
+            SaveResult saved = setFieldValue(field.linkType().name(), key, field, value);
             Set<UUID> affected = linkRegistry.getLinkedPlayers(field.linkType(), key);
-            eventBus.fireLinkedDataChanged(field, key, oldValue, value, affected);
+            eventBus.fireLinkedDataChanged(field, key, oldValue, value, affected, saved.saved() ? saved.version() : -1L);
+            return saved;
         }
     }
 
-    public <K, T> void update(UUID player, LinkedField<K, T> field, UnaryOperator<T> updater) {
+    public <K, T> SaveResult update(UUID player, LinkedField<K, T> field, UnaryOperator<T> updater) {
         K linkKey = linkRegistry.resolve(player, field.linkType());
         if (linkKey == null) {
             throw new IllegalStateException("Player " + player + " is not linked to " + field.linkType().name());
         }
-        updateDirect(linkKey, field, updater);
+        return updateDirect(linkKey, field, updater);
     }
 
-    public <K, T> void updateDirect(K key, LinkedField<K, T> field, UnaryOperator<T> updater) {
+    public <K, T> SaveResult updateDirect(K key, LinkedField<K, T> field, UnaryOperator<T> updater) {
         String ck = compositeKey(field.linkType().name(), key);
         synchronized (getLock(ck)) {
             T oldValue = getFieldValue(field.linkType().name(), key, field);
             T newValue = updater.apply(oldValue);
             Validation.validate(field, newValue);
-            setFieldValue(field.linkType().name(), key, field, newValue);
+            SaveResult saved = setFieldValue(field.linkType().name(), key, field, newValue);
             Set<UUID> affected = linkRegistry.getLinkedPlayers(field.linkType(), key);
-            eventBus.fireLinkedDataChanged(field, key, oldValue, newValue, affected);
+            eventBus.fireLinkedDataChanged(field, key, oldValue, newValue, affected, saved.saved() ? saved.version() : -1L);
+            return saved;
         }
     }
 
@@ -120,30 +129,33 @@ class LinkedDataManager {
         return container.get(field);
     }
 
-    <T> void setFieldValue(String linkTypeName, Object key, DataField<T> field, T value) {
+    <T> SaveResult setFieldValue(String linkTypeName, Object key, DataField<T> field, T value) {
         String ck = compositeKey(linkTypeName, key);
         DataContainer container = getContainer(ck);
         ensureDocumentLoaded(linkTypeName, key, container);
         container.set(field, value);
         if (autoPersist) {
-            persistLinked(linkTypeName, key, container);
+            return persistLinked(linkTypeName, key, container);
         }
+        return SaveResult.unchanged("linked/" + linkTypeName, key.toString(), container.documentVersion());
     }
 
     private void ensureDocumentLoaded(String linkTypeName, Object key, DataContainer container) {
         if (!container.isDocumentLoaded()) {
-            container.loadDocument(format, storage.load("linked/" + linkTypeName, key.toString()));
+            VersionedData loaded = storage.loadVersioned("linked/" + linkTypeName, key.toString());
+            container.loadDocument(format, loaded.data(), loaded.version());
         }
     }
 
-    private void persistLinked(String linkTypeName, String keyString, DataContainer container) {
+    private SaveResult persistLinked(String linkTypeName, String keyString, DataContainer container) {
         byte[] bytes = container.serialize(format);
-        storage.save("linked/" + linkTypeName, keyString, bytes);
-        container.markPersisted(bytes);
+        SaveResult result = storage.save("linked/" + linkTypeName, keyString, bytes).toCompletableFuture().join();
+        container.markPersisted(bytes, result.version());
+        return result;
     }
 
-    private void persistLinked(String linkTypeName, Object key, DataContainer container) {
-        persistLinked(linkTypeName, key.toString(), container);
+    private SaveResult persistLinked(String linkTypeName, Object key, DataContainer container) {
+        return persistLinked(linkTypeName, key.toString(), container);
     }
 
     // ---- Lifecycle ----------------------------------------------------------
@@ -154,31 +166,41 @@ class LinkedDataManager {
         synchronized (getLock(ck)) {
             DataContainer container = getContainer(ck);
             if (!container.isDocumentLoaded()) {
-                container.loadDocument(format, storage.load("linked/" + linkTypeName, key.toString()));
+                VersionedData loaded = storage.loadVersioned("linked/" + linkTypeName, key.toString());
+                container.loadDocument(format, loaded.data(), loaded.version());
             }
         }
     }
 
-    public void flushLinked(String linkTypeName, Object key) {
+    public SaveResult flushLinked(String linkTypeName, Object key) {
         String ck = compositeKey(linkTypeName, key);
         synchronized (getLock(ck)) {
             DataContainer container = cache.get(ck);
             if (container != null && container.isDirty()) {
-                persistLinked(linkTypeName, key, container);
+                SaveResult saved = persistLinked(linkTypeName, key, container);
+                eventBus.fireLinkedSnapshotSaved(linkTypeName, key, saved.version());
+                return saved;
             }
+            return SaveResult.unchanged("linked/" + linkTypeName, key.toString(),
+                    container == null ? 0 : container.documentVersion());
         }
     }
 
-    public void unloadLinked(String linkTypeName, Object key) {
+    public SaveResult unloadLinked(String linkTypeName, Object key) {
+        SaveResult result;
         String ck = compositeKey(linkTypeName, key);
         synchronized (getLock(ck)) {
             DataContainer container = cache.get(ck);
             if (container != null && container.isDirty()) {
-                persistLinked(linkTypeName, key, container);
+                result = persistLinked(linkTypeName, key, container);
+                eventBus.fireLinkedSnapshotSaved(linkTypeName, key, result.version());
+            } else {
+                result = SaveResult.unchanged("linked/" + linkTypeName, key.toString(),
+                        container == null ? 0 : container.documentVersion());
             }
             cache.remove(ck);
         }
-        locks.remove(ck);
+        return result;
     }
 
     public boolean isLinkedLoaded(String linkTypeName, Object key) {
@@ -199,7 +221,8 @@ class LinkedDataManager {
             if (container.isDirty()) {
                 persistLinked(linkTypeName, key, container);
             }
-            container.reload(storage.load("linked/" + linkTypeName, key.toString()));
+            VersionedData loaded = storage.loadVersioned("linked/" + linkTypeName, key.toString());
+            container.reload(loaded.data(), loaded.version());
         }
     }
 
@@ -213,7 +236,8 @@ class LinkedDataManager {
             synchronized (getLock(ck)) {
                 DataContainer container = cache.get(ck);
                 if (container != null && container.isDirty()) {
-                    persistLinked(linkTypeName, keyString, container);
+                    SaveResult saved = persistLinked(linkTypeName, keyString, container);
+                    eventBus.fireLinkedSnapshotSaved(linkTypeName, keyString, saved.version());
                 }
             }
         }
@@ -223,18 +247,51 @@ class LinkedDataManager {
      * Applies a change that originated on another node to a locally cached shared entity,
      * without re-persisting or re-firing events. Only touches entities currently loaded here.
      */
-    <T> void applyRemote(String linkTypeName, Object key, DataField<T> field, T newValue) {
+    <T> boolean applyRemote(String linkTypeName, Object key, DataField<T> field, T newValue, long version) {
         String ck = compositeKey(linkTypeName, key);
         DataContainer container = cache.get(ck);
-        if (container == null) return;
+        if (container == null) return true;
         synchronized (getLock(ck)) {
             container = cache.get(ck);
-            if (container == null) return;
-            container.applyRemote(field, newValue, format);
+            if (container == null) return true;
+            return container.applyRemote(field, newValue, version, format);
         }
     }
 
     public List<String> listLinkedIds(String linkTypeName) {
         return storage.listIds("linked/" + linkTypeName);
+    }
+
+    List<SaveRequest> snapshotDocuments() {
+        List<SaveRequest> requests = new ArrayList<>();
+        for (Map.Entry<String, DataContainer> entry : cache.entrySet()) {
+            String ck = entry.getKey();
+            int colon = ck.indexOf(':');
+            if (colon < 0) continue;
+            synchronized (getLock(ck)) {
+                DataContainer container = cache.get(ck);
+                if (container != null) requests.add(new SaveRequest(
+                        new StorageKey("linked/" + ck.substring(0, colon), ck.substring(colon + 1)),
+                        container.serialize(format)));
+            }
+        }
+        return requests;
+    }
+
+    long currentVersion(String linkTypeName, Object key) {
+        DataContainer container = cache.get(compositeKey(linkTypeName, key));
+        return container == null ? 0L : container.documentVersion();
+    }
+
+    void applyRemoteSnapshot(String linkTypeName, String linkKey, long version) {
+        String ck = compositeKey(linkTypeName, linkKey);
+        DataContainer container = cache.get(ck);
+        if (container == null) return;
+        synchronized (getLock(ck)) {
+            container = cache.get(ck);
+            if (container == null || container.isDirty() || version <= container.documentVersion()) return;
+            VersionedData loaded = storage.loadVersioned("linked/" + linkTypeName, linkKey);
+            if (loaded.version() >= version) container.reload(loaded.data(), loaded.version());
+        }
     }
 }

@@ -8,9 +8,9 @@ import java.time.Duration;
 public class ExpiringLinkedField<K, T> extends LinkedField<K, T> {
     private final Duration defaultTtl;
 
-    private ExpiringLinkedField(String namespace, String key, Codec<T> codec, T defaultValue,
+    private ExpiringLinkedField(FieldKey<T> key, Codec<T> codec, DefaultValueFactory<? extends T> defaultFactory,
                                  LinkType<K> linkType, Validator<T> validator, Duration defaultTtl) {
-        super(namespace, key, codec, defaultValue, linkType, validator);
+        super(key, codec, defaultFactory, linkType, validator);
         this.defaultTtl = defaultTtl;
     }
 
@@ -19,20 +19,22 @@ public class ExpiringLinkedField<K, T> extends LinkedField<K, T> {
     }
 
     public static <K, T> ExpiringLinkedBuilder<K, T> expiringBuilder(String namespace, String key, LinkType<K> linkType) {
-        return new ExpiringLinkedBuilder<>(namespace, key, linkType);
+        return new ExpiringLinkedBuilder<>(FieldKey.of(namespace, key), linkType);
+    }
+
+    public static <K, T> ExpiringLinkedBuilder<K, T> expiringBuilder(FieldKey<T> key, LinkType<K> linkType) {
+        return new ExpiringLinkedBuilder<>(key, linkType);
     }
 
     public static class ExpiringLinkedBuilder<K, T> {
-        private final String namespace;
-        private final String key;
+        private final FieldKey<T> key;
         private final LinkType<K> linkType;
         private Codec<T> codec;
-        private T defaultValue;
+        private DefaultValueFactory<? extends T> defaultFactory = () -> null;
         private Validator<T> validator;
         private Duration defaultTtl;
 
-        private ExpiringLinkedBuilder(String namespace, String key, LinkType<K> linkType) {
-            this.namespace = namespace;
+        private ExpiringLinkedBuilder(FieldKey<T> key, LinkType<K> linkType) {
             this.key = key;
             this.linkType = linkType;
         }
@@ -43,7 +45,12 @@ public class ExpiringLinkedField<K, T> extends LinkedField<K, T> {
         }
 
         public ExpiringLinkedBuilder<K, T> defaultValue(T defaultValue) {
-            this.defaultValue = defaultValue;
+            this.defaultFactory = DefaultValueFactory.copying(() -> codec, defaultValue);
+            return this;
+        }
+
+        public ExpiringLinkedBuilder<K, T> defaultFactory(DefaultValueFactory<? extends T> factory) {
+            this.defaultFactory = java.util.Objects.requireNonNull(factory, "factory");
             return this;
         }
 
@@ -58,7 +65,8 @@ public class ExpiringLinkedField<K, T> extends LinkedField<K, T> {
         }
 
         public ExpiringLinkedField<K, T> build() {
-            return new ExpiringLinkedField<>(namespace, key, codec, defaultValue, linkType, validator, defaultTtl);
+            return new ExpiringLinkedField<>(key, java.util.Objects.requireNonNull(codec, "codec"), defaultFactory,
+                    linkType, validator, java.util.Objects.requireNonNull(defaultTtl, "defaultTtl"));
         }
     }
 }

@@ -9,6 +9,8 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Stream;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 
 public class FileDataStorage implements DataStorage {
     private final Path baseDir;
@@ -43,14 +45,31 @@ public class FileDataStorage implements DataStorage {
     }
 
     @Override
-    public void save(String type, String id, byte[] data) {
+    public synchronized CompletionStage<SaveResult> save(String type, String id, byte[] data) {
         Path path = resolvePath(type, id);
         try {
             Files.createDirectories(path.getParent());
             Files.write(path, data);
+            long version = readVersion(type, id) + 1;
+            Files.writeString(versionPath(type, id), Long.toString(version));
+            return CompletableFuture.completedFuture(SaveResult.saved(type, id, version, data.length));
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
+    }
+
+    @Override
+    public synchronized VersionedData loadVersioned(String type, String id) {
+        return new VersionedData(load(type, id), readVersion(type, id));
+    }
+
+    private Path versionPath(String type, String id) { return baseDir.resolve(type).resolve(id + extension + ".version"); }
+
+    private long readVersion(String type, String id) {
+        Path path = versionPath(type, id);
+        if (!Files.exists(path)) return 0;
+        try { return Long.parseLong(Files.readString(path)); }
+        catch (IOException e) { throw new UncheckedIOException(e); }
     }
 
     @Override
@@ -77,6 +96,7 @@ public class FileDataStorage implements DataStorage {
         Path path = resolvePath(type, id);
         try {
             Files.deleteIfExists(path);
+            Files.deleteIfExists(versionPath(type, id));
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }

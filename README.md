@@ -54,6 +54,18 @@ api.update(player, COINS, c -> c + 100);
 int coins = api.get(player, COINS); // 600
 ```
 
+Writes return a `CompletionStage<SaveResult>`, so callers that need durability confirmation can
+observe failures and the assigned document version:
+
+```java
+SaveResult saved = api.set(player, COINS, 500).toCompletableFuture().join();
+long version = saved.version();
+
+api.loadAsync(player);       // concurrent calls for this player share one in-flight load
+api.flushAsync(player);      // ordered with load/unload for the same player
+api.unloadAsync(player);
+```
+
 ## Storage Backends
 
 | Backend | Persistence | Shared across servers | Indexed leaderboards |
@@ -81,6 +93,15 @@ new RedisDataStorage(pool, "myapp:data") // custom key prefix
 new MongoDataStorage(mongoClient, "myapp")
 ```
 
+Storage ownership is explicit. Constructors default to `StorageOwnership.BORROWED`; choose
+`OWNED` when `DataAPI.shutdown()` should also close the storage and its client/pool:
+
+```java
+DataAPI api = new DataAPIImpl(storage, StorageOwnership.OWNED);
+```
+
+Use `api.snapshot()` with `api.saveSnapshot(...)` for versioned batch/snapshot persistence.
+
 ## Player Fields
 
 Per-player data with type safety, default values, and optional validation.
@@ -102,6 +123,18 @@ int coins = api.get(player, COINS);
 ```
 
 All fields use a `namespace:key` format internally (e.g. `economy:coins`) to prevent collisions between systems.
+For compile-time field identity and fresh mutable defaults, use `FieldKey<T>` and a factory:
+
+```java
+FieldKey<List<String>> QUESTS_KEY = FieldKey.of("profile", "quests");
+PlayerField<List<String>> QUESTS = PlayerField.<List<String>>builder(QUESTS_KEY)
+        .codec(Codecs.list(Codecs.STRING))
+        .defaultFactory(ArrayList::new)
+        .build();
+```
+
+`defaultValue(...)` is also defensively copied through the field codec; a mutable prototype is
+never returned as shared state.
 
 ## Linked Fields (Shared Data)
 

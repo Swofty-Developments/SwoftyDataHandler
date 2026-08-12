@@ -6,6 +6,7 @@ import net.swofty.data.format.JsonFormat;
 import net.swofty.event.*;
 import net.swofty.lock.DistributedLock;
 import net.swofty.storage.DataStorage;
+import net.swofty.storage.*;
 import net.swofty.transaction.TransactionConsumer;
 import net.swofty.transaction.TransactionFunction;
 
@@ -13,6 +14,10 @@ import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.Callable;
+import net.swofty.validation.ValidationException;
 import java.util.function.Predicate;
 import java.util.function.ToDoubleFunction;
 import java.util.function.UnaryOperator;
@@ -27,6 +32,9 @@ public class DataAPIImpl implements DataAPI {
     private final EventBus eventBus;
     private final BulkOperationExecutor bulkOperations;
     private final DistributedLock distributedLock;
+    private final StorageOwnership storageOwnership;
+    private final boolean distributedUpdates;
+    private final AtomicBoolean shutdown = new AtomicBoolean();
 
     public DataAPIImpl(DataStorage storage, DataFormat format, PubSubHandler pubSub) {
         this(storage, format, pubSub, true);
@@ -45,7 +53,14 @@ public class DataAPIImpl implements DataAPI {
      */
     public DataAPIImpl(DataStorage storage, DataFormat format, PubSubHandler pubSub, boolean autoPersist,
                        DistributedLock distributedLock) {
+        this(storage, format, pubSub, autoPersist, distributedLock, StorageOwnership.BORROWED, false);
+    }
+
+    public DataAPIImpl(DataStorage storage, DataFormat format, PubSubHandler pubSub, boolean autoPersist,
+                       DistributedLock distributedLock, StorageOwnership ownership, boolean distributedUpdates) {
         this.storage = storage;
+        this.storageOwnership = Objects.requireNonNull(ownership, "ownership");
+        this.distributedUpdates = distributedUpdates;
         this.distributedLock = distributedLock;
         this.eventBus = (pubSub != null) ? new DistributedEventBus(pubSub) : new EventBus();
         this.linkRegistry = new LinkRegistryImpl();
@@ -63,25 +78,33 @@ public class DataAPIImpl implements DataAPI {
         if (eventBus instanceof DistributedEventBus distributed) {
             distributed.setRemoteChangeHandler(new RemoteChangeHandler() {
                 @Override
-                public <T> void onPlayerChange(DataField<T> field, UUID player, T newValue) {
-                    playerData.applyRemote(field, player, newValue);
+                public <T> boolean onPlayerChange(DataField<T> field, UUID player, T newValue, long version) {
+                    return playerData.applyRemote(field, player, newValue, version);
                 }
 
                 @Override
-                public <T> void onLinkedChange(DataField<T> field, String linkTypeName, String linkKey, T newValue) {
-                    linkedData.applyRemote(linkTypeName, linkKey, field, newValue);
+                public <T> boolean onLinkedChange(DataField<T> field, String linkTypeName, String linkKey, T newValue, long version) {
+                    return linkedData.applyRemote(linkTypeName, linkKey, field, newValue, version);
                 }
 
                 @Override
                 public <K> void onLinked(LinkType<K> type, UUID player, K linkKey) {
                     linkRegistry.link(player, type, linkKey);
-                    playerData.applyRemote(type.playerField(), player, linkKey);
+                    playerData.applyRemote(type.playerField(), player, linkKey, 0L);
                 }
 
                 @Override
                 public <K> void onUnlinked(LinkType<K> type, UUID player, K previousKey) {
                     linkRegistry.unlink(player, type);
-                    playerData.applyRemote(type.playerField(), player, null);
+                    playerData.applyRemote(type.playerField(), player, null, 0L);
+                }
+
+                @Override public void onPlayerSnapshot(UUID player, long version) {
+                    playerData.applyRemoteSnapshot(player, version);
+                }
+
+                @Override public void onLinkedSnapshot(String linkTypeName, String linkKey, long version) {
+                    linkedData.applyRemoteSnapshot(linkTypeName, linkKey, version);
                 }
             });
         }
@@ -99,7 +122,17 @@ public class DataAPIImpl implements DataAPI {
         this(storage, new JsonFormat(), pubSub);
     }
 
+    public DataAPIImpl(DataStorage storage, StorageOwnership ownership) {
+        this(storage, new JsonFormat(), null, true, null, ownership, false);
+    }
+
     // ==================== Player Fields ====================
+
+    private static <T> CompletionStage<T> completed(Callable<T> operation) {
+        try { return CompletableFuture.completedFuture(operation.call()); }
+        catch (ValidationException | IllegalStateException contractFailure) { throw contractFailure; }
+        catch (Throwable failure) { return CompletableFuture.failedFuture(failure); }
+    }
 
     @Override
     public <T> T get(UUID player, PlayerField<T> field) {
@@ -107,13 +140,31 @@ public class DataAPIImpl implements DataAPI {
     }
 
     @Override
-    public <T> void set(UUID player, PlayerField<T> field, T value) {
-        playerData.set(player, field, value);
+    public <T> CompletionStage<SaveResult> set(UUID player, PlayerField<T> field, T value) {
+        return completed(() -> playerData.set(player, field, value));
     }
 
     @Override
-    public <T> void update(UUID player, PlayerField<T> field, UnaryOperator<T> updater) {
-        playerData.update(player, field, updater);
+    public <T> CompletionStage<SaveResult> update(UUID player, PlayerField<T> field, UnaryOperator<T> updater) {
+        return update(player, field, updater, distributedUpdates ? UpdateMode.DISTRIBUTED : UpdateMode.LOCAL);
+    }
+
+    @Override
+    public <T> CompletionStage<SaveResult> update(UUID player, PlayerField<T> field, UnaryOperator<T> updater, UpdateMode mode) {
+        return completed(() -> {
+            if (mode == UpdateMode.DISTRIBUTED) {
+                requireDistributedLock();
+                try (DistributedLock.Handle handle = distributedLock.acquire("player:" + player, Duration.ofSeconds(10))) {
+                    synchronized (playerData.getLock(player)) {
+                        playerData.refresh(player);
+                        SaveResult result = playerData.update(player, field, updater);
+                        handle.ensureValid();
+                        return result;
+                    }
+                }
+            }
+            return playerData.update(player, field, updater);
+        });
     }
 
     // ==================== Linked Fields ====================
@@ -124,13 +175,23 @@ public class DataAPIImpl implements DataAPI {
     }
 
     @Override
-    public <K, T> void set(UUID player, LinkedField<K, T> field, T value) {
-        linkedData.set(player, field, value);
+    public <K, T> CompletionStage<SaveResult> set(UUID player, LinkedField<K, T> field, T value) {
+        return completed(() -> linkedData.set(player, field, value));
     }
 
     @Override
-    public <K, T> void update(UUID player, LinkedField<K, T> field, UnaryOperator<T> updater) {
-        linkedData.update(player, field, updater);
+    public <K, T> CompletionStage<SaveResult> update(UUID player, LinkedField<K, T> field, UnaryOperator<T> updater) {
+        return update(player, field, updater, distributedUpdates ? UpdateMode.DISTRIBUTED : UpdateMode.LOCAL);
+    }
+
+    @Override
+    public <K, T> CompletionStage<SaveResult> update(UUID player, LinkedField<K, T> field,
+                                                      UnaryOperator<T> updater, UpdateMode mode) {
+        return completed(() -> {
+            K key = linkRegistry.resolve(player, field.linkType());
+            if (key == null) throw new IllegalStateException("Player " + player + " is not linked to " + field.linkType().name());
+            return updateDirect(key, field, updater, mode).toCompletableFuture().join();
+        });
     }
 
     @Override
@@ -139,13 +200,33 @@ public class DataAPIImpl implements DataAPI {
     }
 
     @Override
-    public <K, T> void setDirect(K key, LinkedField<K, T> field, T value) {
-        linkedData.setDirect(key, field, value);
+    public <K, T> CompletionStage<SaveResult> setDirect(K key, LinkedField<K, T> field, T value) {
+        return completed(() -> linkedData.setDirect(key, field, value));
     }
 
     @Override
-    public <K, T> void updateDirect(K key, LinkedField<K, T> field, UnaryOperator<T> updater) {
-        linkedData.updateDirect(key, field, updater);
+    public <K, T> CompletionStage<SaveResult> updateDirect(K key, LinkedField<K, T> field, UnaryOperator<T> updater) {
+        return updateDirect(key, field, updater, distributedUpdates ? UpdateMode.DISTRIBUTED : UpdateMode.LOCAL);
+    }
+
+    @Override
+    public <K, T> CompletionStage<SaveResult> updateDirect(K key, LinkedField<K, T> field,
+                                                            UnaryOperator<T> updater, UpdateMode mode) {
+        return completed(() -> {
+            if (mode == UpdateMode.DISTRIBUTED) {
+                requireDistributedLock();
+                String ck = LinkedDataManager.compositeKey(field.linkType().name(), key);
+                try (DistributedLock.Handle handle = distributedLock.acquire("linked:" + ck, Duration.ofSeconds(10))) {
+                    synchronized (linkedData.getLock(ck)) {
+                        linkedData.refresh(field.linkType().name(), key);
+                        SaveResult result = linkedData.updateDirect(key, field, updater);
+                        handle.ensureValid();
+                        return result;
+                    }
+                }
+            }
+            return linkedData.updateDirect(key, field, updater);
+        });
     }
 
     // ==================== Link Management ====================
@@ -154,8 +235,8 @@ public class DataAPIImpl implements DataAPI {
     public <K> void link(UUID player, LinkType<K> type, K key) {
         synchronized (playerData.getLock(player)) {
             linkRegistry.link(player, type, key);
-            playerData.setFieldValue(player, type.playerField(), key);
-            eventBus.fireLinked(type, player, key);
+            SaveResult saved = playerData.setFieldValue(player, type.playerField(), key);
+            eventBus.fireLinked(type, player, key, saved.saved() ? saved.version() : -1L);
         }
     }
 
@@ -164,8 +245,8 @@ public class DataAPIImpl implements DataAPI {
         synchronized (playerData.getLock(player)) {
             K previousKey = linkRegistry.unlink(player, type);
             if (previousKey == null) return;
-            playerData.setFieldValue(player, type.playerField(), null);
-            eventBus.fireUnlinked(type, player, previousKey);
+            SaveResult saved = playerData.setFieldValue(player, type.playerField(), null);
+            eventBus.fireUnlinked(type, player, previousKey, saved.saved() ? saved.version() : -1L);
         }
     }
 
@@ -177,19 +258,22 @@ public class DataAPIImpl implements DataAPI {
     // ==================== Expiring Fields ====================
 
     @Override
-    public <T> void set(UUID player, ExpiringField<T> field, T value) {
-        set(player, field, value, field.defaultTtl());
+    public <T> CompletionStage<SaveResult> set(UUID player, ExpiringField<T> field, T value) {
+        return set(player, field, value, field.defaultTtl());
     }
 
     @Override
-    public <T> void set(UUID player, ExpiringField<T> field, T value, Duration ttl) {
-        Validation.validate(field, value);
-        synchronized (playerData.getLock(player)) {
-            T oldValue = playerData.getFieldValue(player, field);
-            playerData.setFieldValue(player, field, value);
-            expirationManager.setExpiration(player, field, ttl, value);
-            eventBus.firePlayerDataChanged(field, player, oldValue, value);
-        }
+    public <T> CompletionStage<SaveResult> set(UUID player, ExpiringField<T> field, T value, Duration ttl) {
+        return completed(() -> {
+            Validation.validate(field, value);
+            synchronized (playerData.getLock(player)) {
+                T oldValue = playerData.getFieldValue(player, field);
+                SaveResult saved = playerData.setFieldValue(player, field, value);
+                expirationManager.setExpiration(player, field, ttl, value);
+                eventBus.firePlayerDataChanged(field, player, oldValue, value, saved.saved() ? saved.version() : -1L);
+                return saved;
+            }
+        });
     }
 
     @Override
@@ -208,25 +292,29 @@ public class DataAPIImpl implements DataAPI {
     }
 
     @Override
-    public <K, T> void set(UUID player, ExpiringLinkedField<K, T> field, T value) {
-        set(player, field, value, field.defaultTtl());
+    public <K, T> CompletionStage<SaveResult> set(UUID player, ExpiringLinkedField<K, T> field, T value) {
+        return set(player, field, value, field.defaultTtl());
     }
 
     @Override
-    public <K, T> void set(UUID player, ExpiringLinkedField<K, T> field, T value, Duration ttl) {
-        K linkKey = linkRegistry.resolve(player, field.linkType());
-        if (linkKey == null) {
-            throw new IllegalStateException("Player " + player + " is not linked to " + field.linkType().name());
-        }
-        Validation.validate(field, value);
-        String ck = LinkedDataManager.compositeKey(field.linkType().name(), linkKey);
-        synchronized (linkedData.getLock(ck)) {
-            T oldValue = linkedData.getFieldValue(field.linkType().name(), linkKey, field);
-            linkedData.setFieldValue(field.linkType().name(), linkKey, field, value);
-            Set<UUID> affected = linkRegistry.getLinkedPlayers(field.linkType(), linkKey);
-            expirationManager.setLinkedExpiration(field, linkKey, ttl, value, affected);
-            eventBus.fireLinkedDataChanged(field, linkKey, oldValue, value, affected);
-        }
+    public <K, T> CompletionStage<SaveResult> set(UUID player, ExpiringLinkedField<K, T> field, T value, Duration ttl) {
+        return completed(() -> {
+            K linkKey = linkRegistry.resolve(player, field.linkType());
+            if (linkKey == null) {
+                throw new IllegalStateException("Player " + player + " is not linked to " + field.linkType().name());
+            }
+            Validation.validate(field, value);
+            String ck = LinkedDataManager.compositeKey(field.linkType().name(), linkKey);
+            synchronized (linkedData.getLock(ck)) {
+                T oldValue = linkedData.getFieldValue(field.linkType().name(), linkKey, field);
+                SaveResult saved = linkedData.setFieldValue(field.linkType().name(), linkKey, field, value);
+                Set<UUID> affected = linkRegistry.getLinkedPlayers(field.linkType(), linkKey);
+                expirationManager.setLinkedExpiration(field, linkKey, ttl, value, affected);
+                eventBus.fireLinkedDataChanged(field, linkKey, oldValue, value, affected,
+                        saved.saved() ? saved.version() : -1L);
+                return saved;
+            }
+        });
     }
 
     // ==================== Transactions ====================
@@ -339,17 +427,25 @@ public class DataAPIImpl implements DataAPI {
 
     @Override
     public CompletableFuture<Void> loadAsync(UUID player, Executor executor) {
-        return CompletableFuture.runAsync(() -> playerData.load(player), executor);
+        return playerData.loadAsync(player, executor).toCompletableFuture();
     }
 
     @Override
-    public void flush(UUID player) {
-        playerData.flush(player);
+    public SaveResult flush(UUID player) {
+        return playerData.flush(player);
+    }
+
+    @Override public CompletionStage<SaveResult> flushAsync(UUID player, Executor executor) {
+        return playerData.flushAsync(player, executor);
     }
 
     @Override
-    public void unload(UUID player) {
-        playerData.unload(player);
+    public SaveResult unload(UUID player) {
+        return playerData.unload(player);
+    }
+
+    @Override public CompletionStage<SaveResult> unloadAsync(UUID player, Executor executor) {
+        return playerData.unloadAsync(player, executor);
     }
 
     @Override
@@ -368,13 +464,21 @@ public class DataAPIImpl implements DataAPI {
     }
 
     @Override
-    public <K> void flushLink(LinkType<K> type, K key) {
-        linkedData.flushLinked(type.name(), key);
+    public <K> SaveResult flushLink(LinkType<K> type, K key) {
+        return linkedData.flushLinked(type.name(), key);
+    }
+
+    @Override public <K> CompletionStage<SaveResult> flushLinkAsync(LinkType<K> type, K key, Executor executor) {
+        return CompletableFuture.supplyAsync(() -> flushLink(type, key), executor);
     }
 
     @Override
-    public <K> void unloadLink(LinkType<K> type, K key) {
-        linkedData.unloadLinked(type.name(), key);
+    public <K> SaveResult unloadLink(LinkType<K> type, K key) {
+        return linkedData.unloadLinked(type.name(), key);
+    }
+
+    @Override public <K> CompletionStage<SaveResult> unloadLinkAsync(LinkType<K> type, K key, Executor executor) {
+        return CompletableFuture.supplyAsync(() -> unloadLink(type, key), executor);
     }
 
     @Override
@@ -395,14 +499,42 @@ public class DataAPIImpl implements DataAPI {
         return distributedLock.acquire(key, timeout);
     }
 
+    private void requireDistributedLock() {
+        if (distributedLock == null) throw new IllegalStateException("No DistributedLock configured on this DataAPI");
+    }
+
+    @Override public StorageSnapshot snapshot() {
+        List<SaveRequest> documents = new ArrayList<>(playerData.snapshotDocuments());
+        documents.addAll(linkedData.snapshotDocuments());
+        return StorageSnapshot.of(documents);
+    }
+
+    @Override public CompletionStage<BatchSaveResult> saveSnapshot(StorageSnapshot snapshot) {
+        return storage.saveSnapshot(snapshot);
+    }
+
+    @Override public DataStorage storage() { return storage; }
+    @Override public StorageOwnership storageOwnership() { return storageOwnership; }
+
     @Override
     public void shutdown() {
-        // Flush any deferred writes so nothing is lost on a clean shutdown.
-        playerData.flushAll();
-        linkedData.flushAll();
-        expirationManager.shutdown();
+        if (!shutdown.compareAndSet(false, true)) return;
+        RuntimeException failure = null;
+        try { playerData.flushAll(); } catch (RuntimeException e) { failure = e; }
+        try { linkedData.flushAll(); } catch (RuntimeException e) { failure = suppress(failure, e); }
+        try { expirationManager.shutdown(); } catch (RuntimeException e) { failure = suppress(failure, e); }
         if (eventBus instanceof DistributedEventBus deb) {
-            deb.shutdown();
+            try { deb.shutdown(); } catch (RuntimeException e) { failure = suppress(failure, e); }
         }
+        if (storageOwnership == StorageOwnership.OWNED) {
+            try { storage.close(); } catch (RuntimeException e) { failure = suppress(failure, e); }
+        }
+        if (failure != null) throw failure;
+    }
+
+    private static RuntimeException suppress(RuntimeException first, RuntimeException next) {
+        if (first == null) return next;
+        first.addSuppressed(next);
+        return first;
     }
 }

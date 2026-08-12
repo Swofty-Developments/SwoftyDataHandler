@@ -30,6 +30,7 @@ class DataContainer {
     private volatile byte[] backingDocument;
     private volatile boolean documentLoaded;
     private volatile boolean dirty;
+    private volatile long documentVersion;
 
     @SuppressWarnings("unchecked")
     public <T> T get(DataField<T> field) {
@@ -55,8 +56,11 @@ class DataContainer {
     // ---- Document lifecycle -------------------------------------------------
 
     /** Records the full backing document so later partial writes do not drop untouched fields. */
-    public void loadDocument(DataFormat format, byte[] raw) {
+    public void loadDocument(DataFormat format, byte[] raw) { loadDocument(format, raw, 0L); }
+
+    public void loadDocument(DataFormat format, byte[] raw, long version) {
         this.backingDocument = raw;
+        this.documentVersion = version;
         this.documentLoaded = true;
     }
 
@@ -95,10 +99,13 @@ class DataContainer {
      * <p>The cached view is dropped, not merged: callers must hold the entity's exclusive lock and
      * must have flushed pending writes first, or those writes are lost.
      */
-    public void reload(byte[] raw) {
+    public void reload(byte[] raw) { reload(raw, 0L); }
+
+    public void reload(byte[] raw, long version) {
         data.clear();
         tombstones.clear();
         this.backingDocument = raw;
+        this.documentVersion = version;
         this.documentLoaded = true;
         this.dirty = false;
     }
@@ -125,11 +132,14 @@ class DataContainer {
      * of what is in storage: a later local write merges over a base that already carries the
      * remote change instead of resurrecting the value this node last saw.
      */
-    public <T> void applyRemote(DataField<T> field, T value, DataFormat format) {
+    public <T> boolean applyRemote(DataField<T> field, T value, long version, DataFormat format) {
+        if (version > 0 && version <= documentVersion) return false;
         boolean wasDirty = this.dirty;
         set(field, value);
         this.dirty = wasDirty;
         patchBackingDocument(field.fullKey(), value, format);
+        documentVersion = Math.max(documentVersion, version);
+        return true;
     }
 
     // Stores the value exactly as serialize() would — the live object, written out by the
@@ -148,11 +158,14 @@ class DataContainer {
     }
 
     /** Records the bytes just written to storage as the new backing document and clears the dirty flag. */
-    public void markPersisted(byte[] bytes) {
+    public void markPersisted(byte[] bytes, long version) {
         this.backingDocument = bytes;
+        this.documentVersion = Math.max(documentVersion, version);
         this.documentLoaded = true;
         this.dirty = false;
     }
+
+    public long documentVersion() { return documentVersion; }
 
     ConcurrentHashMap<String, Object> rawData() {
         return data;

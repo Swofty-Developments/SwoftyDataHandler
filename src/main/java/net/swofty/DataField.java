@@ -3,12 +3,14 @@ package net.swofty;
 import net.swofty.codec.Codec;
 
 public interface DataField<T> {
-    String namespace();
-    String key();
+    FieldKey<T> fieldKey();
+
+    default String namespace() { return fieldKey().namespace(); }
+    default String key() { return fieldKey().name(); }
     Codec<T> codec();
     T defaultValue();
 
     default String fullKey() {
-        return namespace() + ":" + key();
+        return fieldKey().serializedName();
     }
 }

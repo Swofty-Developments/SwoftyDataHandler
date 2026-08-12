@@ -8,9 +8,9 @@ import java.time.Duration;
 public class ExpiringField<T> extends PlayerField<T> {
     private final Duration defaultTtl;
 
-    private ExpiringField(String namespace, String key, Codec<T> codec, T defaultValue,
+    private ExpiringField(FieldKey<T> key, Codec<T> codec, DefaultValueFactory<? extends T> defaultFactory,
                            Validator<T> validator, Duration defaultTtl) {
-        super(namespace, key, codec, defaultValue, validator);
+        super(key, codec, defaultFactory, validator);
         this.defaultTtl = defaultTtl;
     }
 
@@ -19,19 +19,19 @@ public class ExpiringField<T> extends PlayerField<T> {
     }
 
     public static <T> ExpiringBuilder<T> expiringBuilder(String namespace, String key) {
-        return new ExpiringBuilder<>(namespace, key);
+        return new ExpiringBuilder<>(FieldKey.of(namespace, key));
     }
 
+    public static <T> ExpiringBuilder<T> expiringBuilder(FieldKey<T> key) { return new ExpiringBuilder<>(key); }
+
     public static class ExpiringBuilder<T> {
-        private final String namespace;
-        private final String key;
+        private final FieldKey<T> key;
         private Codec<T> codec;
-        private T defaultValue;
+        private DefaultValueFactory<? extends T> defaultFactory = () -> null;
         private Validator<T> validator;
         private Duration defaultTtl;
 
-        private ExpiringBuilder(String namespace, String key) {
-            this.namespace = namespace;
+        private ExpiringBuilder(FieldKey<T> key) {
             this.key = key;
         }
 
@@ -41,7 +41,12 @@ public class ExpiringField<T> extends PlayerField<T> {
         }
 
         public ExpiringBuilder<T> defaultValue(T defaultValue) {
-            this.defaultValue = defaultValue;
+            this.defaultFactory = DefaultValueFactory.copying(() -> codec, defaultValue);
+            return this;
+        }
+
+        public ExpiringBuilder<T> defaultFactory(DefaultValueFactory<? extends T> factory) {
+            this.defaultFactory = java.util.Objects.requireNonNull(factory, "factory");
             return this;
         }
 
@@ -56,7 +61,8 @@ public class ExpiringField<T> extends PlayerField<T> {
         }
 
         public ExpiringField<T> build() {
-            return new ExpiringField<>(namespace, key, codec, defaultValue, validator, defaultTtl);
+            return new ExpiringField<>(key, java.util.Objects.requireNonNull(codec, "codec"), defaultFactory,
+                    validator, java.util.Objects.requireNonNull(defaultTtl, "defaultTtl"));
         }
     }
 }

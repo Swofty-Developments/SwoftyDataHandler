@@ -19,6 +19,18 @@ public interface DistributedLock {
 
     /** A held lock. Closing it releases the lock and never throws a checked exception. */
     interface Handle extends AutoCloseable {
+        /** Monotonic token suitable for rejecting writes from an older lock holder. */
+        default long fencingToken() { return 0L; }
+
+        /** Renews the lease. Returns false when ownership has already been lost. */
+        default boolean renew() { return true; }
+
+        default boolean isValid() { return true; }
+
+        default void ensureValid() {
+            if (!isValid()) throw new LockAcquisitionException("Distributed lock lease was lost");
+        }
+
         @Override
         void close();
     }

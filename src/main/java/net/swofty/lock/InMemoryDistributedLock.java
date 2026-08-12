@@ -4,6 +4,7 @@ import java.time.Duration;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * A single-JVM {@link DistributedLock} backed by {@link ReentrantLock}. Useful for tests and
@@ -12,6 +13,7 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 public class InMemoryDistributedLock implements DistributedLock {
     private final ConcurrentHashMap<String, ReentrantLock> locks = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AtomicLong> fences = new ConcurrentHashMap<>();
 
     @Override
     public Handle acquire(String key, Duration timeout) {
@@ -24,6 +26,12 @@ public class InMemoryDistributedLock implements DistributedLock {
             Thread.currentThread().interrupt();
             throw new LockAcquisitionException("Interrupted acquiring lock: " + key);
         }
-        return lock::unlock;
+        long fence = fences.computeIfAbsent(key, ignored -> new AtomicLong()).incrementAndGet();
+        return new Handle() {
+            private volatile boolean valid = true;
+            @Override public long fencingToken() { return fence; }
+            @Override public boolean isValid() { return valid; }
+            @Override public void close() { if (valid) { valid = false; lock.unlock(); } }
+        };
     }
 }

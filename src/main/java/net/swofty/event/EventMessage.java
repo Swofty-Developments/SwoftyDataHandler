@@ -6,14 +6,16 @@ class EventMessage {
     String type;
     String fieldKey;
     String sourceNodeId;
+    long version;
     Map<String, Object> data;
 
     EventMessage() {}
 
-    EventMessage(String type, String fieldKey, String sourceNodeId, Map<String, Object> data) {
+    EventMessage(String type, String fieldKey, String sourceNodeId, long version, Map<String, Object> data) {
         this.type = type;
         this.fieldKey = fieldKey;
         this.sourceNodeId = sourceNodeId;
+        this.version = version;
         this.data = data;
     }
 }

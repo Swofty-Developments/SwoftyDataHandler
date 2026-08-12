@@ -2,9 +2,13 @@ package net.swofty.storage;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class InMemoryDataStorage implements DataStorage, LeaderboardIndex {
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, byte[]>> data = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<StorageKey, AtomicLong> versions = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, Double>> leaderboards = new ConcurrentHashMap<>();
 
     @Override
@@ -14,8 +18,22 @@ public class InMemoryDataStorage implements DataStorage, LeaderboardIndex {
     }
 
     @Override
-    public void save(String type, String id, byte[] bytes) {
-        data.computeIfAbsent(type, k -> new ConcurrentHashMap<>()).put(id, bytes);
+    public VersionedData loadVersioned(String type, String id) {
+        StorageKey key = new StorageKey(type, id);
+        AtomicLong version = versions.get(key);
+        if (version == null) return new VersionedData(load(type, id), 0L);
+        synchronized (version) { return new VersionedData(load(type, id), version.get()); }
+    }
+
+    @Override
+    public CompletionStage<SaveResult> save(String type, String id, byte[] bytes) {
+        StorageKey key = new StorageKey(type, id);
+        long version;
+        synchronized (versions.computeIfAbsent(key, ignored -> new AtomicLong())) {
+            data.computeIfAbsent(type, k -> new ConcurrentHashMap<>()).put(id, Arrays.copyOf(bytes, bytes.length));
+            version = versions.get(key).incrementAndGet();
+        }
+        return CompletableFuture.completedFuture(SaveResult.saved(type, id, version, bytes.length));
     }
 
     @Override
@@ -29,6 +47,7 @@ public class InMemoryDataStorage implements DataStorage, LeaderboardIndex {
         ConcurrentHashMap<String, byte[]> bucket = data.get(type);
         if (bucket != null) {
             bucket.remove(id);
+            versions.remove(new StorageKey(type, id));
         }
     }
 

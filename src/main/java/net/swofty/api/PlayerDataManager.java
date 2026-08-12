@@ -8,9 +8,16 @@ import net.swofty.data.DataFormat;
 import net.swofty.event.EventBus;
 import net.swofty.storage.DataStorage;
 import net.swofty.storage.LeaderboardIndex;
+import net.swofty.storage.SaveRequest;
+import net.swofty.storage.SaveResult;
+import net.swofty.storage.StorageKey;
+import net.swofty.storage.VersionedData;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.Executor;
 import java.util.function.ToDoubleFunction;
 import java.util.function.UnaryOperator;
 
@@ -22,7 +29,7 @@ class PlayerDataManager {
     private final DataFormat format;
     private final EventBus eventBus;
     private final ConcurrentHashMap<UUID, DataContainer> cache = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<UUID, Object> locks = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<UUID, EntitySession> sessions = new ConcurrentHashMap<>();
     // Optional custom score functions, keyed by field. Numeric fields need no entry here — they
     // are scored automatically — so leaderboards require no registration in the common case.
     private final ConcurrentHashMap<String, ToDoubleFunction<?>> scorers = new ConcurrentHashMap<>();
@@ -40,8 +47,10 @@ class PlayerDataManager {
     }
 
     public Object getLock(UUID player) {
-        return locks.computeIfAbsent(player, k -> new Object());
+        return session(player);
     }
+
+    private EntitySession session(UUID player) { return sessions.computeIfAbsent(player, ignored -> new EntitySession()); }
 
     DataContainer getContainer(UUID player) {
         return cache.computeIfAbsent(player, id -> new DataContainer());
@@ -56,22 +65,24 @@ class PlayerDataManager {
         }
     }
 
-    public <T> void set(UUID player, PlayerField<T> field, T value) {
+    public <T> SaveResult set(UUID player, PlayerField<T> field, T value) {
         Validation.validate(field, value);
         synchronized (getLock(player)) {
             T oldValue = getFieldValue(player, field);
-            setFieldValue(player, field, value);
-            eventBus.firePlayerDataChanged(field, player, oldValue, value);
+            SaveResult saved = setFieldValue(player, field, value);
+            eventBus.firePlayerDataChanged(field, player, oldValue, value, saved.saved() ? saved.version() : -1L);
+            return saved;
         }
     }
 
-    public <T> void update(UUID player, PlayerField<T> field, UnaryOperator<T> updater) {
+    public <T> SaveResult update(UUID player, PlayerField<T> field, UnaryOperator<T> updater) {
         synchronized (getLock(player)) {
             T oldValue = getFieldValue(player, field);
             T newValue = updater.apply(oldValue);
             Validation.validate(field, newValue);
-            setFieldValue(player, field, newValue);
-            eventBus.firePlayerDataChanged(field, player, oldValue, newValue);
+            SaveResult saved = setFieldValue(player, field, newValue);
+            eventBus.firePlayerDataChanged(field, player, oldValue, newValue, saved.saved() ? saved.version() : -1L);
+            return saved;
         }
     }
 
@@ -85,31 +96,35 @@ class PlayerDataManager {
         return container.get(field);
     }
 
-    <T> void setFieldValue(UUID player, DataField<T> field, T value) {
+    <T> SaveResult setFieldValue(UUID player, DataField<T> field, T value) {
         DataContainer container = getContainer(player);
         // Warm the backing document first so serialize() merges over it and never
         // drops fields that were never read this session.
         ensureDocumentLoaded(player, container);
         container.set(field, value);
         if (autoPersist) {
-            persist(player);
+            return persist(player);
         }
+        return SaveResult.unchanged("players", player.toString(), container.documentVersion());
     }
 
     private void ensureDocumentLoaded(UUID player, DataContainer container) {
         if (!container.isDocumentLoaded()) {
-            container.loadDocument(format, storage.load("players", player.toString()));
+            VersionedData loaded = storage.loadVersioned("players", player.toString());
+            container.loadDocument(format, loaded.data(), loaded.version());
         }
     }
 
-    void persist(UUID player) {
+    SaveResult persist(UUID player) {
         DataContainer container = cache.get(player);
         if (container != null) {
             byte[] bytes = container.serialize(format);
-            storage.save("players", player.toString(), bytes);
-            container.markPersisted(bytes);
+            SaveResult result = storage.save("players", player.toString(), bytes).toCompletableFuture().join();
+            container.markPersisted(bytes, result.version());
             updateLeaderboards(player, container);
+            return result;
         }
+        return SaveResult.unchanged("players", player.toString(), 0);
     }
 
     // ---- Leaderboard indexing ----------------------------------------------
@@ -190,31 +205,82 @@ class PlayerDataManager {
         synchronized (getLock(player)) {
             DataContainer container = getContainer(player);
             if (!container.isDocumentLoaded()) {
-                container.loadDocument(format, storage.load("players", player.toString()));
+                VersionedData loaded = storage.loadVersioned("players", player.toString());
+                container.loadDocument(format, loaded.data(), loaded.version());
             }
         }
+    }
+
+    public CompletionStage<Void> loadAsync(UUID player, Executor executor) {
+        EntitySession session = session(player);
+        synchronized (session) {
+            if (cache.get(player) != null && cache.get(player).isDocumentLoaded()) {
+                return CompletableFuture.completedFuture(null);
+            }
+            if (session.loading != null) return session.loading;
+            CompletableFuture<Void> future = new CompletableFuture<>();
+            session.loading = future;
+            try {
+                executor.execute(() -> {
+                    try { load(player); future.complete(null); }
+                    catch (Throwable failure) { future.completeExceptionally(failure); }
+                    finally { synchronized (session) { if (session.loading == future) session.loading = null; } }
+                });
+            } catch (Throwable failure) {
+                session.loading = null;
+                future.completeExceptionally(failure);
+            }
+            return future;
+        }
+    }
+
+    private void awaitLoad(UUID player) {
+        CompletableFuture<Void> loading = session(player).loading;
+        if (loading != null) loading.join();
     }
 
     /** Persists pending changes for a player if the cache holds unsaved edits. */
-    public void flush(UUID player) {
+    public SaveResult flush(UUID player) {
+        awaitLoad(player);
         synchronized (getLock(player)) {
             DataContainer container = cache.get(player);
             if (container != null && container.isDirty()) {
-                persist(player);
+                SaveResult saved = persist(player);
+                eventBus.firePlayerSnapshotSaved(player, saved.version());
+                return saved;
             }
+            DataContainer current = cache.get(player);
+            return SaveResult.unchanged("players", player.toString(), current == null ? 0 : current.documentVersion());
         }
     }
 
+    public CompletionStage<SaveResult> flushAsync(UUID player, Executor executor) {
+        CompletableFuture<Void> loading = session(player).loading;
+        CompletionStage<Void> before = loading == null ? CompletableFuture.completedFuture(null) : loading;
+        return before.thenApplyAsync(ignored -> flush(player), executor);
+    }
+
     /** Flushes pending changes then evicts the player from this node's cache. */
-    public void unload(UUID player) {
+    public SaveResult unload(UUID player) {
+        awaitLoad(player);
+        SaveResult result;
         synchronized (getLock(player)) {
             DataContainer container = cache.get(player);
             if (container != null && container.isDirty()) {
-                persist(player);
+                result = persist(player);
+                eventBus.firePlayerSnapshotSaved(player, result.version());
+            } else {
+                result = SaveResult.unchanged("players", player.toString(), container == null ? 0 : container.documentVersion());
             }
             cache.remove(player);
         }
-        locks.remove(player);
+        return result;
+    }
+
+    public CompletionStage<SaveResult> unloadAsync(UUID player, Executor executor) {
+        CompletableFuture<Void> loading = session(player).loading;
+        CompletionStage<Void> before = loading == null ? CompletableFuture.completedFuture(null) : loading;
+        return before.thenApplyAsync(ignored -> unload(player), executor);
     }
 
     public boolean isLoaded(UUID player) {
@@ -238,7 +304,8 @@ class PlayerDataManager {
             if (container.isDirty()) {
                 persist(player);
             }
-            container.reload(storage.load("players", player.toString()));
+            VersionedData loaded = storage.loadVersioned("players", player.toString());
+            container.reload(loaded.data(), loaded.version());
         }
     }
 
@@ -254,13 +321,41 @@ class PlayerDataManager {
      * without re-persisting or re-firing events. Only touches players that are currently
      * loaded here, so it never resurrects an evicted or never-loaded entity.
      */
-    <T> void applyRemote(DataField<T> field, UUID player, T newValue) {
+    <T> boolean applyRemote(DataField<T> field, UUID player, T newValue, long version) {
+        DataContainer container = cache.get(player);
+        if (container == null) return true;
+        synchronized (getLock(player)) {
+            container = cache.get(player);
+            if (container == null) return true;
+            return container.applyRemote(field, newValue, version, format);
+        }
+    }
+
+    List<SaveRequest> snapshotDocuments() {
+        List<SaveRequest> requests = new ArrayList<>();
+        for (UUID player : cache.keySet()) {
+            synchronized (getLock(player)) {
+                DataContainer container = cache.get(player);
+                if (container != null) requests.add(new SaveRequest(new StorageKey("players", player.toString()),
+                        container.serialize(format)));
+            }
+        }
+        return requests;
+    }
+
+    long currentVersion(UUID player) {
+        DataContainer container = cache.get(player);
+        return container == null ? 0L : container.documentVersion();
+    }
+
+    void applyRemoteSnapshot(UUID player, long version) {
         DataContainer container = cache.get(player);
         if (container == null) return;
         synchronized (getLock(player)) {
             container = cache.get(player);
-            if (container == null) return;
-            container.applyRemote(field, newValue, format);
+            if (container == null || container.isDirty() || version <= container.documentVersion()) return;
+            VersionedData loaded = storage.loadVersioned("players", player.toString());
+            if (loaded.version() >= version) container.reload(loaded.data(), loaded.version());
         }
     }
 

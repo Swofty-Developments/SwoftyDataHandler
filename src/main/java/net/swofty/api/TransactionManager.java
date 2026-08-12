@@ -61,12 +61,13 @@ class TransactionManager {
     }
 
     public <R> R execute(UUID player, TransactionFunction<R> action) {
-        try (DistributedLock.Handle ignored = acquire("player:" + player)) {
+        try (DistributedLock.Handle handle = acquire("player:" + player)) {
             synchronized (playerData.getLock(player)) {
                 refreshPlayer(player);
                 TransactionContext tx = new TransactionContext(player, null, null);
                 try {
                     R result = action.apply(tx);
+                    handle.ensureValid();
                     tx.commit();
                     return result;
                 } catch (TransactionAbortException e) {
@@ -81,12 +82,13 @@ class TransactionManager {
     }
 
     public void execute(UUID player, TransactionConsumer action) {
-        try (DistributedLock.Handle ignored = acquire("player:" + player)) {
+        try (DistributedLock.Handle handle = acquire("player:" + player)) {
             synchronized (playerData.getLock(player)) {
                 refreshPlayer(player);
                 TransactionContext tx = new TransactionContext(player, null, null);
                 try {
                     action.accept(tx);
+                    handle.ensureValid();
                     tx.commit();
                 } catch (TransactionAbortException e) {
                     tx.rollback();
@@ -100,12 +102,13 @@ class TransactionManager {
 
     public <K, R> R executeDirect(K key, LinkType<K> type, TransactionFunction<R> action) {
         String ck = LinkedDataManager.compositeKey(type.name(), key);
-        try (DistributedLock.Handle ignored = acquire("linked:" + ck)) {
+        try (DistributedLock.Handle handle = acquire("linked:" + ck)) {
             synchronized (linkedData.getLock(ck)) {
                 refreshLinked(type.name(), key);
                 TransactionContext tx = new TransactionContext(null, type, key);
                 try {
                     R result = action.apply(tx);
+                    handle.ensureValid();
                     tx.commit();
                     return result;
                 } catch (TransactionAbortException e) {
@@ -274,7 +277,7 @@ class TransactionManager {
             for (Map.Entry<String, Write> entry : newPlayerValues.entrySet()) {
                 Write write = entry.getValue();
                 eventBus.firePlayerDataChanged((DataField<Object>) write.field(), player,
-                        originalPlayerValues.get(entry.getKey()), write.value());
+                        originalPlayerValues.get(entry.getKey()), write.value(), playerData.currentVersion(player));
             }
 
             for (Map.Entry<String, Write> entry : newLinkedValues.entrySet()) {
@@ -284,7 +287,8 @@ class TransactionManager {
                 if (linkKey == null) continue;
                 Set<UUID> affected = linkRegistry.getLinkedPlayers((LinkType<Object>) field.linkType(), linkKey);
                 eventBus.fireLinkedDataChanged(field, linkKey,
-                        originalLinkedValues.get(entry.getKey()), write.value(), affected);
+                        originalLinkedValues.get(entry.getKey()), write.value(), affected,
+                        linkedData.currentVersion(field.linkType().name(), linkKey));
             }
         }
 

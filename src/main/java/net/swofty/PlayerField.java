@@ -4,17 +4,20 @@ import net.swofty.codec.Codec;
 import net.swofty.validation.Validator;
 
 public class PlayerField<T> implements DataField<T> {
-    private final String namespace;
-    private final String key;
+    private final FieldKey<T> fieldKey;
     private final Codec<T> codec;
-    private final T defaultValue;
+    private final DefaultValueFactory<? extends T> defaultFactory;
     private final Validator<T> validator;
 
     protected PlayerField(String namespace, String key, Codec<T> codec, T defaultValue, Validator<T> validator) {
-        this.namespace = namespace;
-        this.key = key;
+        this(FieldKey.of(namespace, key), codec, DefaultValueFactory.copying(codec, defaultValue), validator);
+    }
+
+    protected PlayerField(FieldKey<T> fieldKey, Codec<T> codec,
+                          DefaultValueFactory<? extends T> defaultFactory, Validator<T> validator) {
+        this.fieldKey = java.util.Objects.requireNonNull(fieldKey, "fieldKey");
         this.codec = codec;
-        this.defaultValue = defaultValue;
+        this.defaultFactory = java.util.Objects.requireNonNull(defaultFactory, "defaultFactory");
         this.validator = validator;
     }
 
@@ -23,18 +26,13 @@ public class PlayerField<T> implements DataField<T> {
     }
 
     public static <T> Builder<T> builder(String namespace, String key) {
-        return new Builder<>(namespace, key);
+        return new Builder<>(FieldKey.of(namespace, key));
     }
 
-    @Override
-    public String namespace() {
-        return namespace;
-    }
+    public static <T> Builder<T> builder(FieldKey<T> key) { return new Builder<>(key); }
 
     @Override
-    public String key() {
-        return key;
-    }
+    public FieldKey<T> fieldKey() { return fieldKey; }
 
     @Override
     public Codec<T> codec() {
@@ -43,7 +41,7 @@ public class PlayerField<T> implements DataField<T> {
 
     @Override
     public T defaultValue() {
-        return defaultValue;
+        return defaultFactory.create();
     }
 
     public Validator<T> validator() {
@@ -51,15 +49,13 @@ public class PlayerField<T> implements DataField<T> {
     }
 
     public static class Builder<T> {
-        private final String namespace;
-        private final String key;
+        private final FieldKey<T> fieldKey;
         private Codec<T> codec;
-        private T defaultValue;
+        private DefaultValueFactory<? extends T> defaultFactory = () -> null;
         private Validator<T> validator;
 
-        private Builder(String namespace, String key) {
-            this.namespace = namespace;
-            this.key = key;
+        private Builder(FieldKey<T> fieldKey) {
+            this.fieldKey = fieldKey;
         }
 
         public Builder<T> codec(Codec<T> codec) {
@@ -68,7 +64,12 @@ public class PlayerField<T> implements DataField<T> {
         }
 
         public Builder<T> defaultValue(T defaultValue) {
-            this.defaultValue = defaultValue;
+            this.defaultFactory = DefaultValueFactory.copying(() -> codec, defaultValue);
+            return this;
+        }
+
+        public Builder<T> defaultFactory(DefaultValueFactory<? extends T> factory) {
+            this.defaultFactory = java.util.Objects.requireNonNull(factory, "factory");
             return this;
         }
 
@@ -78,7 +79,7 @@ public class PlayerField<T> implements DataField<T> {
         }
 
         public PlayerField<T> build() {
-            return new PlayerField<>(namespace, key, codec, defaultValue, validator);
+            return new PlayerField<>(fieldKey, java.util.Objects.requireNonNull(codec, "codec"), defaultFactory, validator);
         }
     }
 }

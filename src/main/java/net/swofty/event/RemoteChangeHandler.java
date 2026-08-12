@@ -12,13 +12,17 @@ import java.util.UUID;
  * no knowledge of how data is cached.
  */
 public interface RemoteChangeHandler {
-    <T> void onPlayerChange(DataField<T> field, UUID player, T newValue);
+    <T> boolean onPlayerChange(DataField<T> field, UUID player, T newValue, long version);
 
-    <T> void onLinkedChange(DataField<T> field, String linkTypeName, String linkKey, T newValue);
+    <T> boolean onLinkedChange(DataField<T> field, String linkTypeName, String linkKey, T newValue, long version);
 
     /** A player was linked on another node, so this node's link state can converge on it. */
     default <K> void onLinked(LinkType<K> type, UUID player, K linkKey) {}
 
     /** A player was unlinked on another node. */
     default <K> void onUnlinked(LinkType<K> type, UUID player, K previousKey) {}
+
+    default void onPlayerSnapshot(UUID player, long version) {}
+
+    default void onLinkedSnapshot(String linkTypeName, String linkKey, long version) {}
 }

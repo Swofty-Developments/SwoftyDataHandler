@@ -27,6 +27,7 @@ public class DistributedEventBus extends EventBus {
 
     private final ConcurrentHashMap<String, DataField<?>> fieldRegistry = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, LinkType<?>> linkTypeRegistry = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Long> receivedVersions = new ConcurrentHashMap<>();
 
     private volatile RemoteChangeHandler remoteChangeHandler;
 
@@ -81,41 +82,72 @@ public class DistributedEventBus extends EventBus {
 
     @Override
     public <T> void firePlayerDataChanged(DataField<T> field, UUID player, T oldValue, T newValue) {
+        firePlayerDataChanged(field, player, oldValue, newValue, 0L);
+    }
+
+    @Override
+    public <T> void firePlayerDataChanged(DataField<T> field, UUID player, T oldValue, T newValue, long version) {
         super.firePlayerDataChanged(field, player, oldValue, newValue);
+        if (version < 0) return;
+        remember("player:" + player + ":" + field.fullKey(), version);
         Map<String, Object> data = payload();
         put(data, "player", player.toString());
         put(data, "oldValue", serializeValue(field.codec(), oldValue));
         put(data, "newValue", serializeValue(field.codec(), newValue));
-        publish(new EventMessage("PLAYER_DATA_CHANGED", field.fullKey(), nodeId, data));
+        publish(new EventMessage("PLAYER_DATA_CHANGED", field.fullKey(), nodeId, version, data));
     }
 
     @Override
     public <K, T> void fireLinkedDataChanged(DataField<T> field, K linkKey, T oldValue, T newValue, Set<UUID> affected) {
+        fireLinkedDataChanged(field, linkKey, oldValue, newValue, affected, 0L);
+    }
+
+    @Override
+    public <K, T> void fireLinkedDataChanged(DataField<T> field, K linkKey, T oldValue, T newValue,
+                                              Set<UUID> affected, long version) {
         super.fireLinkedDataChanged(field, linkKey, oldValue, newValue, affected);
+        if (version < 0) return;
+        if (field instanceof LinkedField<?, ?> linked) {
+            remember("linked:" + linked.linkType().name() + ":" + linkKey + ":" + field.fullKey(), version);
+        }
         Map<String, Object> data = payload();
         put(data, "linkKey", serializeLinkKey(field, linkKey));
         put(data, "oldValue", serializeValue(field.codec(), oldValue));
         put(data, "newValue", serializeValue(field.codec(), newValue));
         put(data, "affected", uuidSetToList(affected));
-        publish(new EventMessage("LINKED_DATA_CHANGED", field.fullKey(), nodeId, data));
+        publish(new EventMessage("LINKED_DATA_CHANGED", field.fullKey(), nodeId, version, data));
     }
 
     @Override
     public <K> void fireLinked(LinkType<K> type, UUID player, K linkKey) {
+        fireLinked(type, player, linkKey, 0L);
+    }
+
+    @Override
+    public <K> void fireLinked(LinkType<K> type, UUID player, K linkKey, long version) {
         super.fireLinked(type, player, linkKey);
+        if (version < 0) return;
+        remember("player:" + player + ":link:" + type.name(), version);
         Map<String, Object> data = payload();
         put(data, "player", player.toString());
         put(data, "linkKey", serializeValue(type.keyCodec(), linkKey));
-        publish(new EventMessage("LINKED", type.name(), nodeId, data));
+        publish(new EventMessage("LINKED", type.name(), nodeId, version, data));
     }
 
     @Override
     public <K> void fireUnlinked(LinkType<K> type, UUID player, K previousKey) {
+        fireUnlinked(type, player, previousKey, 0L);
+    }
+
+    @Override
+    public <K> void fireUnlinked(LinkType<K> type, UUID player, K previousKey, long version) {
         super.fireUnlinked(type, player, previousKey);
+        if (version < 0) return;
+        remember("player:" + player + ":link:" + type.name(), version);
         Map<String, Object> data = payload();
         put(data, "player", player.toString());
         put(data, "previousKey", serializeValue(type.keyCodec(), previousKey));
-        publish(new EventMessage("UNLINKED", type.name(), nodeId, data));
+        publish(new EventMessage("UNLINKED", type.name(), nodeId, version, data));
     }
 
     @Override
@@ -124,7 +156,7 @@ public class DistributedEventBus extends EventBus {
         Map<String, Object> data = payload();
         put(data, "player", playerId.toString());
         put(data, "expiredValue", serializeValue(field.codec(), expiredValue));
-        publish(new EventMessage("EXPIRED", field.fullKey(), nodeId, data));
+        publish(new EventMessage("EXPIRED", field.fullKey(), nodeId, 0L, data));
     }
 
     @Override
@@ -134,7 +166,24 @@ public class DistributedEventBus extends EventBus {
         put(data, "linkKey", serializeLinkKey(field, linkKey));
         put(data, "expiredValue", serializeValue(field.codec(), expiredValue));
         put(data, "memberIds", uuidSetToList(memberIds));
-        publish(new EventMessage("LINKED_EXPIRED", field.fullKey(), nodeId, data));
+        publish(new EventMessage("LINKED_EXPIRED", field.fullKey(), nodeId, 0L, data));
+    }
+
+    @Override
+    public void firePlayerSnapshotSaved(UUID player, long version) {
+        remember("player:" + player + ":snapshot", version);
+        Map<String, Object> data = payload();
+        put(data, "player", player.toString());
+        publish(new EventMessage("PLAYER_SNAPSHOT_SAVED", "", nodeId, version, data));
+    }
+
+    @Override
+    public void fireLinkedSnapshotSaved(String linkTypeName, Object linkKey, long version) {
+        remember("linked:" + linkTypeName + ":" + linkKey + ":snapshot", version);
+        Map<String, Object> data = payload();
+        put(data, "linkType", linkTypeName);
+        put(data, "linkKey", linkKey.toString());
+        publish(new EventMessage("LINKED_SNAPSHOT_SAVED", "", nodeId, version, data));
     }
 
     // A null-valued field is a legitimate state (an unset nullable field, a cleared link), so
@@ -173,7 +222,24 @@ public class DistributedEventBus extends EventBus {
             case "UNLINKED" -> handleUnlinked(msg);
             case "EXPIRED" -> handleExpired(msg);
             case "LINKED_EXPIRED" -> handleLinkedExpired(msg);
+            case "PLAYER_SNAPSHOT_SAVED" -> handlePlayerSnapshot(msg);
+            case "LINKED_SNAPSHOT_SAVED" -> handleLinkedSnapshot(msg);
         }
+    }
+
+    private void handlePlayerSnapshot(EventMessage msg) {
+        UUID player = UUID.fromString((String) msg.data.get("player"));
+        if (stale(msg, "player:" + player + ":snapshot")) return;
+        RemoteChangeHandler handler = remoteChangeHandler;
+        if (handler != null) handler.onPlayerSnapshot(player, msg.version);
+    }
+
+    private void handleLinkedSnapshot(EventMessage msg) {
+        String linkType = (String) msg.data.get("linkType");
+        String linkKey = (String) msg.data.get("linkKey");
+        if (stale(msg, "linked:" + linkType + ":" + linkKey + ":snapshot")) return;
+        RemoteChangeHandler handler = remoteChangeHandler;
+        if (handler != null) handler.onLinkedSnapshot(linkType, linkKey, msg.version);
     }
 
     @SuppressWarnings("unchecked")
@@ -181,11 +247,12 @@ public class DistributedEventBus extends EventBus {
         DataField<Object> field = (DataField<Object>) fieldRegistry.get(msg.fieldKey);
         if (field == null) return;
         UUID player = UUID.fromString((String) msg.data.get("player"));
+        if (stale(msg, "player:" + player + ":" + msg.fieldKey)) return;
         Object oldValue = deserializeValue(field.codec(), msg.data.get("oldValue"));
         Object newValue = deserializeValue(field.codec(), msg.data.get("newValue"));
         RemoteChangeHandler handler = remoteChangeHandler;
         if (handler != null) {
-            handler.onPlayerChange(field, player, newValue);
+            if (!handler.onPlayerChange(field, player, newValue, msg.version)) return;
         }
         super.firePlayerDataChanged(field, player, oldValue, newValue);
     }
@@ -196,14 +263,32 @@ public class DistributedEventBus extends EventBus {
         if (!(field instanceof LinkedField<?, ?> linkedField)) return;
         Object linkKey = deserializeLinkKey(linkedField, msg.data.get("linkKey"));
         if (linkKey == null) return;
+        if (stale(msg, "linked:" + linkedField.linkType().name() + ":" + linkKey + ":" + msg.fieldKey)) return;
         Object oldValue = deserializeValue(field.codec(), msg.data.get("oldValue"));
         Object newValue = deserializeValue(field.codec(), msg.data.get("newValue"));
         Set<UUID> affected = listToUuidSet(msg.data.get("affected"));
         RemoteChangeHandler handler = remoteChangeHandler;
         if (handler != null) {
-            handler.onLinkedChange(field, linkedField.linkType().name(), linkKey.toString(), newValue);
+            if (!handler.onLinkedChange(field, linkedField.linkType().name(), linkKey.toString(), newValue, msg.version)) return;
         }
         super.fireLinkedDataChanged(field, linkKey, oldValue, newValue, affected);
+    }
+
+    private boolean stale(EventMessage message, String stream) {
+        if (message.version <= 0) return false;
+        final boolean[] stale = {false};
+        receivedVersions.compute(stream, (ignored, previous) -> {
+            if (previous != null && message.version <= previous) {
+                stale[0] = true;
+                return previous;
+            }
+            return message.version;
+        });
+        return stale[0];
+    }
+
+    private void remember(String stream, long version) {
+        if (version > 0) receivedVersions.merge(stream, version, Math::max);
     }
 
     @SuppressWarnings("unchecked")
@@ -211,6 +296,7 @@ public class DistributedEventBus extends EventBus {
         LinkType<Object> type = (LinkType<Object>) linkTypeRegistry.get(msg.fieldKey);
         if (type == null) return;
         UUID player = UUID.fromString((String) msg.data.get("player"));
+        if (stale(msg, "player:" + player + ":link:" + msg.fieldKey)) return;
         Object linkKey = deserializeValue(type.keyCodec(), msg.data.get("linkKey"));
         RemoteChangeHandler handler = remoteChangeHandler;
         if (handler != null && linkKey != null) {
@@ -224,6 +310,7 @@ public class DistributedEventBus extends EventBus {
         LinkType<Object> type = (LinkType<Object>) linkTypeRegistry.get(msg.fieldKey);
         if (type == null) return;
         UUID player = UUID.fromString((String) msg.data.get("player"));
+        if (stale(msg, "player:" + player + ":link:" + msg.fieldKey)) return;
         Object previousKey = deserializeValue(type.keyCodec(), msg.data.get("previousKey"));
         RemoteChangeHandler handler = remoteChangeHandler;
         if (handler != null) {
