@@ -11,7 +11,11 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -176,6 +180,69 @@ class ExpiringFieldTest {
         api.set(player, shield, true, Duration.ofHours(6));
 
         assertEquals(true, api.get(player, shield));
+    }
+
+    // ==================== Expiration Events ====================
+
+    @Test
+    void expirationListenerFiresOnExpiry() throws InterruptedException {
+        ExpiringField<String> shortLived = ExpiringField.<String>expiringBuilder("test", "short_lived")
+                .codec(Codecs.STRING)
+                .defaultValue("")
+                .defaultTtl(Duration.ofMillis(200))
+                .build();
+
+        UUID player = UUID.randomUUID();
+        CountDownLatch fired = new CountDownLatch(1);
+        AtomicReference<String> expiredValue = new AtomicReference<>();
+        AtomicReference<UUID> expiredPlayer = new AtomicReference<>();
+
+        api.subscribeExpiration(shortLived, (p, field, value) -> {
+            expiredPlayer.set(p);
+            expiredValue.set(value);
+            fired.countDown();
+        });
+
+        api.set(player, shortLived, "boost");
+
+        assertTrue(fired.await(5, TimeUnit.SECONDS), "expiration listener never fired");
+        assertEquals(player, expiredPlayer.get());
+        assertEquals("boost", expiredValue.get());
+        assertTrue(api.isExpired(player, shortLived));
+    }
+
+    @Test
+    void linkedExpirationListenerFiresOnExpiry() throws InterruptedException {
+        PlayerField<UUID> islandIdField = PlayerField.create("test", "island_id_exp3", Codecs.nullable(Codecs.UUID), null);
+        LinkType<UUID> island = LinkType.create("island_exp3", Codecs.UUID, islandIdField);
+        ExpiringLinkedField<UUID, Integer> buff = ExpiringLinkedField.<UUID, Integer>expiringBuilder("test", "buff", island)
+                .codec(Codecs.INT)
+                .defaultValue(0)
+                .defaultTtl(Duration.ofMillis(200))
+                .build();
+
+        UUID player = UUID.randomUUID();
+        UUID islandId = UUID.randomUUID();
+        api.link(player, island, islandId);
+
+        CountDownLatch fired = new CountDownLatch(1);
+        AtomicReference<UUID> expiredKey = new AtomicReference<>();
+        AtomicReference<Integer> expiredValue = new AtomicReference<>();
+        AtomicReference<Set<UUID>> members = new AtomicReference<>();
+
+        api.subscribeExpiration(buff, (key, field, value, memberIds) -> {
+            expiredKey.set(key);
+            expiredValue.set(value);
+            members.set(memberIds);
+            fired.countDown();
+        });
+
+        api.set(player, buff, 5);
+
+        assertTrue(fired.await(5, TimeUnit.SECONDS), "linked expiration listener never fired");
+        assertEquals(islandId, expiredKey.get());
+        assertEquals(5, expiredValue.get());
+        assertTrue(members.get().contains(player));
     }
 
     @Test

@@ -95,6 +95,22 @@ class EventTest {
     }
 
     @Test
+    void throwingListenerDoesNotStopOtherListeners() {
+        UUID player = UUID.randomUUID();
+        AtomicInteger callCount = new AtomicInteger(0);
+
+        api.subscribe(COINS, (p, old, nw) -> {
+            throw new IllegalStateException("listener blew up");
+        });
+        api.subscribe(COINS, (p, old, nw) -> callCount.incrementAndGet());
+
+        api.set(player, COINS, 100);
+
+        assertEquals(1, callCount.get());
+        assertEquals(100, api.get(player, COINS));
+    }
+
+    @Test
     void listenerForOneFieldDoesNotFireForAnother() {
         UUID player = UUID.randomUUID();
         AtomicBoolean fired = new AtomicBoolean(false);
