@@ -7,16 +7,22 @@ public class LinkedField<K, T> implements DataField<T> {
     private final String namespace;
     private final String key;
     private final Codec<T> codec;
-    private final T defaultValue;
+    private final DefaultValueFactory<? extends T> defaultFactory;
     private final LinkType<K> linkType;
     private final Validator<T> validator;
 
     protected LinkedField(String namespace, String key, Codec<T> codec, T defaultValue,
                            LinkType<K> linkType, Validator<T> validator) {
+        this(namespace, key, codec, DefaultValueFactory.constant(defaultValue), linkType, validator);
+    }
+
+    protected LinkedField(String namespace, String key, Codec<T> codec,
+                          DefaultValueFactory<? extends T> defaultFactory,
+                          LinkType<K> linkType, Validator<T> validator) {
         this.namespace = namespace;
         this.key = key;
         this.codec = codec;
-        this.defaultValue = defaultValue;
+        this.defaultFactory = defaultFactory;
         this.linkType = linkType;
         this.validator = validator;
     }
@@ -47,7 +53,7 @@ public class LinkedField<K, T> implements DataField<T> {
 
     @Override
     public T defaultValue() {
-        return defaultValue;
+        return defaultFactory.create();
     }
 
     public LinkType<K> linkType() {
@@ -63,7 +69,7 @@ public class LinkedField<K, T> implements DataField<T> {
         private final String key;
         private final LinkType<K> linkType;
         private Codec<T> codec;
-        private T defaultValue;
+        private DefaultValueFactory<? extends T> defaultFactory = DefaultValueFactory.constant(null);
         private Validator<T> validator;
 
         private Builder(String namespace, String key, LinkType<K> linkType) {
@@ -78,7 +84,16 @@ public class LinkedField<K, T> implements DataField<T> {
         }
 
         public Builder<K, T> defaultValue(T defaultValue) {
-            this.defaultValue = defaultValue;
+            this.defaultFactory = DefaultValueFactory.constant(defaultValue);
+            return this;
+        }
+
+        /**
+         * Produces a fresh default on every miss, for mutable defaults that must not be shared.
+         * {@link #defaultValue(Object)} keeps returning the one constant it was given.
+         */
+        public Builder<K, T> defaultFactory(DefaultValueFactory<? extends T> factory) {
+            this.defaultFactory = java.util.Objects.requireNonNull(factory, "factory");
             return this;
         }
 
@@ -88,7 +103,7 @@ public class LinkedField<K, T> implements DataField<T> {
         }
 
         public LinkedField<K, T> build() {
-            return new LinkedField<>(namespace, key, codec, defaultValue, linkType, validator);
+            return new LinkedField<>(namespace, key, codec, defaultFactory, linkType, validator);
         }
     }
 }

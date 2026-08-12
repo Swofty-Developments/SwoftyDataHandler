@@ -20,13 +20,34 @@ import java.util.concurrent.ConcurrentHashMap;
 public class DistributedEventBus extends EventBus {
     private static final Gson GSON = new GsonBuilder().create();
     private static final Type MAP_TYPE = new TypeToken<Map<String, Object>>() {}.getType();
+    private static final String SNAPSHOT_STREAM = "snapshot";
+    // Not a stream but a floor over all of them: the version of the whole document this node last
+    // read. Every event at or below it is already part of what was read.
+    private static final String DOCUMENT_FLOOR = "*document";
+    // How many entities one eviction pass may look at. Pinned entities cannot be evicted, and
+    // walking past a wall of them on every published and received event turned the ordering state
+    // into a per-event scan of the whole map.
+    private static final int EVICTION_SCAN_LIMIT = 64;
+    private static final String PLAYER_PREFIX = "player:";
+    private static final String LINKED_PREFIX = "linked:";
 
     private final PubSubHandler pubSubHandler;
     private final String nodeId;
     private final JsonFormat serializationFormat = new JsonFormat();
 
+    // How many entities' ordering state to keep for entities this node does NOT cache. Keeping one
+    // entry for every entity the whole cluster ever writes is a leak, but the cap must never reach
+    // an entity that is loaded here: dropping its state makes the node accept a replayed older
+    // event and revert live data, which the next local write then makes durable.
+    private static final int MAX_UNCACHED_TRACKED_ENTITIES = 4096;
+
     private final ConcurrentHashMap<String, DataField<?>> fieldRegistry = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, LinkType<?>> linkTypeRegistry = new ConcurrentHashMap<>();
+
+    // entity -> stream -> highest version seen. Field events are ordered per field, not per
+    // document: one transaction stamps every field it wrote with the same document version, and a
+    // per-document guard would drop all but the first of them.
+    private final LinkedHashMap<String, Map<String, Long>> sequences = new LinkedHashMap<>(64, 0.75f, true);
 
     private volatile RemoteChangeHandler remoteChangeHandler;
 
@@ -56,6 +77,12 @@ public class DistributedEventBus extends EventBus {
     @Override
     public <K, T> void subscribeLinked(DataField<T> field, LinkedDataListener<K, T> listener) {
         fieldRegistry.put(field.fullKey(), field);
+        // Caring about a linked field means caring about the entity it belongs to, so the link type
+        // is registered too: without it this node would ignore link, unlink and delete events for
+        // the very entity whose fields it is listening to.
+        if (field instanceof LinkedField<?, ?> linked) {
+            linkTypeRegistry.putIfAbsent(linked.linkType().name(), linked.linkType());
+        }
         super.subscribeLinked(field, listener);
     }
 
@@ -81,41 +108,70 @@ public class DistributedEventBus extends EventBus {
 
     @Override
     public <T> void firePlayerDataChanged(DataField<T> field, UUID player, T oldValue, T newValue) {
+        firePlayerDataChanged(field, player, oldValue, newValue, 0L);
+    }
+
+    @Override
+    public <T> void firePlayerDataChanged(DataField<T> field, UUID player, T oldValue, T newValue, long version) {
         super.firePlayerDataChanged(field, player, oldValue, newValue);
+        remember(playerEntity(player), field.fullKey(), version);
         Map<String, Object> data = payload();
         put(data, "player", player.toString());
         put(data, "oldValue", serializeValue(field.codec(), oldValue));
         put(data, "newValue", serializeValue(field.codec(), newValue));
-        publish(new EventMessage("PLAYER_DATA_CHANGED", field.fullKey(), nodeId, data));
+        publish(new EventMessage("PLAYER_DATA_CHANGED", field.fullKey(), nodeId, version, data));
     }
 
     @Override
     public <K, T> void fireLinkedDataChanged(DataField<T> field, K linkKey, T oldValue, T newValue, Set<UUID> affected) {
+        fireLinkedDataChanged(field, linkKey, oldValue, newValue, affected, 0L);
+    }
+
+    @Override
+    public <K, T> void fireLinkedDataChanged(DataField<T> field, K linkKey, T oldValue, T newValue,
+                                              Set<UUID> affected, long version) {
         super.fireLinkedDataChanged(field, linkKey, oldValue, newValue, affected);
+        if (field instanceof LinkedField<?, ?> linked) {
+            remember(linkedEntity(linked.linkType().name(), linkKey), field.fullKey(), version);
+        }
         Map<String, Object> data = payload();
         put(data, "linkKey", serializeLinkKey(field, linkKey));
         put(data, "oldValue", serializeValue(field.codec(), oldValue));
         put(data, "newValue", serializeValue(field.codec(), newValue));
         put(data, "affected", uuidSetToList(affected));
-        publish(new EventMessage("LINKED_DATA_CHANGED", field.fullKey(), nodeId, data));
+        publish(new EventMessage("LINKED_DATA_CHANGED", field.fullKey(), nodeId, version, data));
     }
 
     @Override
     public <K> void fireLinked(LinkType<K> type, UUID player, K linkKey) {
+        fireLinked(type, player, linkKey, 0L);
+    }
+
+    @Override
+    public <K> void fireLinked(LinkType<K> type, UUID player, K linkKey, long version) {
         super.fireLinked(type, player, linkKey);
+        // Link state is registry state, not a document write: it publishes even on a node that
+        // defers its writes, because a peer that never hears about the link cannot resolve it.
+        remember(playerEntity(player), linkStream(type.name()), version);
         Map<String, Object> data = payload();
         put(data, "player", player.toString());
         put(data, "linkKey", serializeValue(type.keyCodec(), linkKey));
-        publish(new EventMessage("LINKED", type.name(), nodeId, data));
+        publish(new EventMessage("LINKED", type.name(), nodeId, version, data));
     }
 
     @Override
     public <K> void fireUnlinked(LinkType<K> type, UUID player, K previousKey) {
+        fireUnlinked(type, player, previousKey, 0L);
+    }
+
+    @Override
+    public <K> void fireUnlinked(LinkType<K> type, UUID player, K previousKey, long version) {
         super.fireUnlinked(type, player, previousKey);
+        remember(playerEntity(player), linkStream(type.name()), version);
         Map<String, Object> data = payload();
         put(data, "player", player.toString());
         put(data, "previousKey", serializeValue(type.keyCodec(), previousKey));
-        publish(new EventMessage("UNLINKED", type.name(), nodeId, data));
+        publish(new EventMessage("UNLINKED", type.name(), nodeId, version, data));
     }
 
     @Override
@@ -124,7 +180,7 @@ public class DistributedEventBus extends EventBus {
         Map<String, Object> data = payload();
         put(data, "player", playerId.toString());
         put(data, "expiredValue", serializeValue(field.codec(), expiredValue));
-        publish(new EventMessage("EXPIRED", field.fullKey(), nodeId, data));
+        publish(new EventMessage("EXPIRED", field.fullKey(), nodeId, 0L, data));
     }
 
     @Override
@@ -134,7 +190,32 @@ public class DistributedEventBus extends EventBus {
         put(data, "linkKey", serializeLinkKey(field, linkKey));
         put(data, "expiredValue", serializeValue(field.codec(), expiredValue));
         put(data, "memberIds", uuidSetToList(memberIds));
-        publish(new EventMessage("LINKED_EXPIRED", field.fullKey(), nodeId, data));
+        publish(new EventMessage("LINKED_EXPIRED", field.fullKey(), nodeId, 0L, data));
+    }
+
+    @Override
+    public void firePlayerSnapshotSaved(UUID player, long version) {
+        remember(playerEntity(player), SNAPSHOT_STREAM, version);
+        Map<String, Object> data = payload();
+        put(data, "player", player.toString());
+        publish(new EventMessage("PLAYER_SNAPSHOT_SAVED", "", nodeId, version, data));
+    }
+
+    @Override
+    public void fireLinkedSnapshotSaved(String linkTypeName, Object linkKey, long version) {
+        remember(linkedEntity(linkTypeName, linkKey), SNAPSHOT_STREAM, version);
+        Map<String, Object> data = payload();
+        put(data, "linkType", linkTypeName);
+        put(data, "linkKey", linkKey.toString());
+        publish(new EventMessage("LINKED_SNAPSHOT_SAVED", "", nodeId, version, data));
+    }
+
+    @Override
+    public <K> void fireLinkDeleted(LinkType<K> type, K linkKey) {
+        forgetLinked(type.name(), linkKey);
+        Map<String, Object> data = payload();
+        put(data, "linkKey", serializeValue(type.keyCodec(), linkKey));
+        publish(new EventMessage("LINK_DELETED", type.name(), nodeId, 0L, data));
     }
 
     // A null-valued field is a legitimate state (an unset nullable field, a cleared link), so
@@ -173,7 +254,25 @@ public class DistributedEventBus extends EventBus {
             case "UNLINKED" -> handleUnlinked(msg);
             case "EXPIRED" -> handleExpired(msg);
             case "LINKED_EXPIRED" -> handleLinkedExpired(msg);
+            case "PLAYER_SNAPSHOT_SAVED" -> handlePlayerSnapshot(msg);
+            case "LINKED_SNAPSHOT_SAVED" -> handleLinkedSnapshot(msg);
+            case "LINK_DELETED" -> handleLinkDeleted(msg);
         }
+    }
+
+    private void handlePlayerSnapshot(EventMessage msg) {
+        UUID player = UUID.fromString((String) msg.data.get("player"));
+        if (stale(playerEntity(player), SNAPSHOT_STREAM, msg.version)) return;
+        RemoteChangeHandler handler = remoteChangeHandler;
+        if (handler != null) handler.onPlayerSnapshot(player, msg.version);
+    }
+
+    private void handleLinkedSnapshot(EventMessage msg) {
+        String linkType = (String) msg.data.get("linkType");
+        String linkKey = (String) msg.data.get("linkKey");
+        if (stale(linkedEntity(linkType, linkKey), SNAPSHOT_STREAM, msg.version)) return;
+        RemoteChangeHandler handler = remoteChangeHandler;
+        if (handler != null) handler.onLinkedSnapshot(linkType, linkKey, msg.version);
     }
 
     @SuppressWarnings("unchecked")
@@ -181,6 +280,7 @@ public class DistributedEventBus extends EventBus {
         DataField<Object> field = (DataField<Object>) fieldRegistry.get(msg.fieldKey);
         if (field == null) return;
         UUID player = UUID.fromString((String) msg.data.get("player"));
+        if (stale(playerEntity(player), msg.fieldKey, msg.version)) return;
         Object oldValue = deserializeValue(field.codec(), msg.data.get("oldValue"));
         Object newValue = deserializeValue(field.codec(), msg.data.get("newValue"));
         RemoteChangeHandler handler = remoteChangeHandler;
@@ -196,6 +296,7 @@ public class DistributedEventBus extends EventBus {
         if (!(field instanceof LinkedField<?, ?> linkedField)) return;
         Object linkKey = deserializeLinkKey(linkedField, msg.data.get("linkKey"));
         if (linkKey == null) return;
+        if (stale(linkedEntity(linkedField.linkType().name(), linkKey), msg.fieldKey, msg.version)) return;
         Object oldValue = deserializeValue(field.codec(), msg.data.get("oldValue"));
         Object newValue = deserializeValue(field.codec(), msg.data.get("newValue"));
         Set<UUID> affected = listToUuidSet(msg.data.get("affected"));
@@ -206,11 +307,133 @@ public class DistributedEventBus extends EventBus {
         super.fireLinkedDataChanged(field, linkKey, oldValue, newValue, affected);
     }
 
+    /**
+     * Rejects an event that has already been superseded on the same stream.
+     *
+     * <p>A stream is one field of one entity, not the whole document: a transaction writes several
+     * fields at one document version, and two nodes can legitimately write different fields at
+     * versions that arrive out of order. Version 0 means the publisher had no durable version to
+     * order by (a deferred write), so it is always delivered.
+     */
+    private boolean stale(String entity, String stream, long version) {
+        if (version <= 0) return false;
+        synchronized (sequences) {
+            Map<String, Long> streams = sequences.computeIfAbsent(entity, ignored -> new HashMap<>());
+            Long floor = streams.get(DOCUMENT_FLOOR);
+            if (floor != null && version <= floor) return true;
+            Long previous = streams.get(stream);
+            if (previous != null && version <= previous) return true;
+            streams.put(stream, version);
+            evictUncachedEntities();
+            return false;
+        }
+    }
+
+    @Override
+    public void rememberPlayerDocument(UUID player, long version) {
+        remember(playerEntity(player), DOCUMENT_FLOOR, version);
+    }
+
+    @Override
+    public void rememberLinkedDocument(String linkTypeName, Object linkKey, long version) {
+        remember(linkedEntity(linkTypeName, linkKey), DOCUMENT_FLOOR, version);
+    }
+
+    private void remember(String entity, String stream, long version) {
+        if (version <= 0) return;
+        synchronized (sequences) {
+            sequences.computeIfAbsent(entity, ignored -> new HashMap<>()).merge(stream, version, Math::max);
+            evictUncachedEntities();
+        }
+    }
+
+    // Walks from the least recently touched entity, skipping the ones this node caches. Those are
+    // pinned for as long as they are loaded, so the map can exceed the cap - by the number of
+    // entities this node is actually serving, which is bounded by the node itself.
+    //
+    // The walk is capped, because a node serving more entities than the cap would otherwise step
+    // over every one of them on every single event, on the pub/sub receive path, holding this
+    // monitor. Whatever pinned entities it did step over are moved to the young end afterwards, so
+    // the next pass starts on candidates that might actually be evictable instead of the same wall.
+    private void evictUncachedEntities() {
+        int overflow = sequences.size() - MAX_UNCACHED_TRACKED_ENTITIES;
+        if (overflow <= 0) return;
+        List<String> steppedOver = null;
+        int examined = 0;
+        Iterator<Map.Entry<String, Map<String, Long>>> entities = sequences.entrySet().iterator();
+        while (overflow > 0 && examined++ < EVICTION_SCAN_LIMIT && entities.hasNext()) {
+            String entity = entities.next().getKey();
+            if (cachedHere(entity)) {
+                if (steppedOver == null) steppedOver = new ArrayList<>();
+                steppedOver.add(entity);
+                continue;
+            }
+            entities.remove();
+            overflow--;
+        }
+        if (steppedOver == null) return;
+        for (String entity : steppedOver) {
+            sequences.get(entity);
+        }
+    }
+
+    private boolean cachedHere(String entity) {
+        RemoteChangeHandler handler = remoteChangeHandler;
+        if (handler == null) return false;
+        if (entity.startsWith(PLAYER_PREFIX)) {
+            try {
+                return handler.isPlayerCached(UUID.fromString(entity.substring(PLAYER_PREFIX.length())));
+            } catch (IllegalArgumentException notAPlayerId) {
+                return false;
+            }
+        }
+        if (entity.startsWith(LINKED_PREFIX)) {
+            String rest = entity.substring(LINKED_PREFIX.length());
+            int colon = rest.indexOf(':');
+            if (colon < 0) return false;
+            return handler.isLinkedCached(rest.substring(0, colon), rest.substring(colon + 1));
+        }
+        return false;
+    }
+
+    @Override
+    public void forgetPlayer(UUID player) {
+        synchronized (sequences) {
+            sequences.remove(playerEntity(player));
+        }
+    }
+
+    @Override
+    public void forgetLinked(String linkTypeName, Object linkKey) {
+        synchronized (sequences) {
+            sequences.remove(linkedEntity(linkTypeName, linkKey));
+        }
+    }
+
+    private static String playerEntity(UUID player) {
+        return PLAYER_PREFIX + player;
+    }
+
+    private static String linkedEntity(String linkTypeName, Object linkKey) {
+        return LINKED_PREFIX + linkTypeName + ":" + linkKey;
+    }
+
+    private static String linkStream(String linkTypeName) {
+        return "link:" + linkTypeName;
+    }
+
+    int trackedEntities() {
+        synchronized (sequences) {
+            return sequences.size();
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private void handleLinked(EventMessage msg) {
         LinkType<Object> type = (LinkType<Object>) linkTypeRegistry.get(msg.fieldKey);
         if (type == null) return;
         UUID player = UUID.fromString((String) msg.data.get("player"));
+        if (stale(playerEntity(player), linkStream(msg.fieldKey), msg.version)) return;
         Object linkKey = deserializeValue(type.keyCodec(), msg.data.get("linkKey"));
         RemoteChangeHandler handler = remoteChangeHandler;
         if (handler != null && linkKey != null) {
@@ -224,12 +447,27 @@ public class DistributedEventBus extends EventBus {
         LinkType<Object> type = (LinkType<Object>) linkTypeRegistry.get(msg.fieldKey);
         if (type == null) return;
         UUID player = UUID.fromString((String) msg.data.get("player"));
+        if (stale(playerEntity(player), linkStream(msg.fieldKey), msg.version)) return;
         Object previousKey = deserializeValue(type.keyCodec(), msg.data.get("previousKey"));
         RemoteChangeHandler handler = remoteChangeHandler;
         if (handler != null) {
             handler.onUnlinked(type, player, previousKey);
         }
         super.fireUnlinked(type, player, previousKey);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void handleLinkDeleted(EventMessage msg) {
+        LinkType<Object> type = (LinkType<Object>) linkTypeRegistry.get(msg.fieldKey);
+        if (type == null) return;
+        Object linkKey = deserializeValue(type.keyCodec(), msg.data.get("linkKey"));
+        if (linkKey == null) return;
+        forgetLinked(type.name(), linkKey);
+        RemoteChangeHandler handler = remoteChangeHandler;
+        if (handler == null) return;
+        for (UUID player : handler.onLinkedDeleted(type, linkKey)) {
+            super.fireUnlinked(type, player, linkKey);
+        }
     }
 
     @SuppressWarnings("unchecked")

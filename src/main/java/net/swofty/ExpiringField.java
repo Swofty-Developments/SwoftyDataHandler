@@ -8,9 +8,10 @@ import java.time.Duration;
 public class ExpiringField<T> extends PlayerField<T> {
     private final Duration defaultTtl;
 
-    private ExpiringField(String namespace, String key, Codec<T> codec, T defaultValue,
+    private ExpiringField(String namespace, String key, Codec<T> codec,
+                           DefaultValueFactory<? extends T> defaultFactory,
                            Validator<T> validator, Duration defaultTtl) {
-        super(namespace, key, codec, defaultValue, validator);
+        super(namespace, key, codec, defaultFactory, validator);
         this.defaultTtl = defaultTtl;
     }
 
@@ -26,7 +27,7 @@ public class ExpiringField<T> extends PlayerField<T> {
         private final String namespace;
         private final String key;
         private Codec<T> codec;
-        private T defaultValue;
+        private DefaultValueFactory<? extends T> defaultFactory = DefaultValueFactory.constant(null);
         private Validator<T> validator;
         private Duration defaultTtl;
 
@@ -41,7 +42,16 @@ public class ExpiringField<T> extends PlayerField<T> {
         }
 
         public ExpiringBuilder<T> defaultValue(T defaultValue) {
-            this.defaultValue = defaultValue;
+            this.defaultFactory = DefaultValueFactory.constant(defaultValue);
+            return this;
+        }
+
+        /**
+         * Produces a fresh default on every miss, for mutable defaults that must not be shared.
+         * {@link #defaultValue(Object)} keeps returning the one constant it was given.
+         */
+        public ExpiringBuilder<T> defaultFactory(DefaultValueFactory<? extends T> factory) {
+            this.defaultFactory = java.util.Objects.requireNonNull(factory, "factory");
             return this;
         }
 
@@ -56,7 +66,7 @@ public class ExpiringField<T> extends PlayerField<T> {
         }
 
         public ExpiringField<T> build() {
-            return new ExpiringField<>(namespace, key, codec, defaultValue, validator, defaultTtl);
+            return new ExpiringField<>(namespace, key, codec, defaultFactory, validator, defaultTtl);
         }
     }
 }

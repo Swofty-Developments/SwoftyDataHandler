@@ -4,6 +4,7 @@ import net.swofty.*;
 import net.swofty.event.EventBus;
 import net.swofty.storage.DataStorage;
 import net.swofty.storage.LeaderboardIndex;
+import net.swofty.storage.SaveResult;
 
 import java.util.*;
 import java.util.function.Predicate;
@@ -98,8 +99,12 @@ class BulkOperationExecutor {
                 if (filter.test(value)) {
                     T newValue = updater.apply(value);
                     Validation.validate(field, newValue);
-                    playerData.setFieldValue(playerId, field, newValue);
-                    eventBus.firePlayerDataChanged(field, playerId, value, newValue);
+                    // The version the write produced is what lets peers order this against their
+                    // own; publishing it unversioned made a bulk update apply unconditionally,
+                    // including after a newer write to the same field.
+                    SaveResult saved = playerData.setFieldValue(playerId, field, newValue);
+                    eventBus.firePlayerDataChanged(field, playerId, value, newValue,
+                            PlayerDataManager.eventVersion(saved));
                     count++;
                 }
             }

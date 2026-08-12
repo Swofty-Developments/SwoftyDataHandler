@@ -8,9 +8,10 @@ import java.time.Duration;
 public class ExpiringLinkedField<K, T> extends LinkedField<K, T> {
     private final Duration defaultTtl;
 
-    private ExpiringLinkedField(String namespace, String key, Codec<T> codec, T defaultValue,
+    private ExpiringLinkedField(String namespace, String key, Codec<T> codec,
+                                 DefaultValueFactory<? extends T> defaultFactory,
                                  LinkType<K> linkType, Validator<T> validator, Duration defaultTtl) {
-        super(namespace, key, codec, defaultValue, linkType, validator);
+        super(namespace, key, codec, defaultFactory, linkType, validator);
         this.defaultTtl = defaultTtl;
     }
 
@@ -27,7 +28,7 @@ public class ExpiringLinkedField<K, T> extends LinkedField<K, T> {
         private final String key;
         private final LinkType<K> linkType;
         private Codec<T> codec;
-        private T defaultValue;
+        private DefaultValueFactory<? extends T> defaultFactory = DefaultValueFactory.constant(null);
         private Validator<T> validator;
         private Duration defaultTtl;
 
@@ -43,7 +44,16 @@ public class ExpiringLinkedField<K, T> extends LinkedField<K, T> {
         }
 
         public ExpiringLinkedBuilder<K, T> defaultValue(T defaultValue) {
-            this.defaultValue = defaultValue;
+            this.defaultFactory = DefaultValueFactory.constant(defaultValue);
+            return this;
+        }
+
+        /**
+         * Produces a fresh default on every miss, for mutable defaults that must not be shared.
+         * {@link #defaultValue(Object)} keeps returning the one constant it was given.
+         */
+        public ExpiringLinkedBuilder<K, T> defaultFactory(DefaultValueFactory<? extends T> factory) {
+            this.defaultFactory = java.util.Objects.requireNonNull(factory, "factory");
             return this;
         }
 
@@ -58,7 +68,7 @@ public class ExpiringLinkedField<K, T> extends LinkedField<K, T> {
         }
 
         public ExpiringLinkedField<K, T> build() {
-            return new ExpiringLinkedField<>(namespace, key, codec, defaultValue, linkType, validator, defaultTtl);
+            return new ExpiringLinkedField<>(namespace, key, codec, defaultFactory, linkType, validator, defaultTtl);
         }
     }
 }

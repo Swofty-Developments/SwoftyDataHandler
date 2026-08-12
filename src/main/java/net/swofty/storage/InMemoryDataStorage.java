@@ -2,9 +2,11 @@ package net.swofty.storage;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class InMemoryDataStorage implements DataStorage, LeaderboardIndex {
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, byte[]>> data = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<StorageKey, AtomicLong> versions = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, Double>> leaderboards = new ConcurrentHashMap<>();
 
     @Override
@@ -14,8 +16,41 @@ public class InMemoryDataStorage implements DataStorage, LeaderboardIndex {
     }
 
     @Override
+    public VersionedData loadVersioned(String type, String id) {
+        AtomicLong version = versions.get(new StorageKey(type, id));
+        if (version == null) return new VersionedData(load(type, id), VersionedData.UNVERSIONED);
+        // The per-key monitor is what makes the data and the version one observation.
+        synchronized (version) {
+            return new VersionedData(load(type, id), version.get());
+        }
+    }
+
+    @Override
     public void save(String type, String id, byte[] bytes) {
-        data.computeIfAbsent(type, k -> new ConcurrentHashMap<>()).put(id, bytes);
+        AtomicLong version = version(type, id);
+        synchronized (version) {
+            store(type, id, bytes);
+            version.incrementAndGet();
+        }
+    }
+
+    @Override
+    public SaveResult saveIfVersion(String type, String id, byte[] bytes, long expectedVersion) {
+        AtomicLong version = version(type, id);
+        synchronized (version) {
+            long current = version.get();
+            if (current != expectedVersion) return SaveResult.conflict(type, id, current);
+            store(type, id, bytes);
+            return SaveResult.saved(type, id, version.incrementAndGet());
+        }
+    }
+
+    private AtomicLong version(String type, String id) {
+        return versions.computeIfAbsent(new StorageKey(type, id), ignored -> new AtomicLong());
+    }
+
+    private void store(String type, String id, byte[] bytes) {
+        data.computeIfAbsent(type, k -> new ConcurrentHashMap<>()).put(id, Arrays.copyOf(bytes, bytes.length));
     }
 
     @Override
@@ -29,6 +64,7 @@ public class InMemoryDataStorage implements DataStorage, LeaderboardIndex {
         ConcurrentHashMap<String, byte[]> bucket = data.get(type);
         if (bucket != null) {
             bucket.remove(id);
+            versions.remove(new StorageKey(type, id));
         }
     }
 

@@ -9,25 +9,29 @@ import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ForkJoinPool;
 import java.util.function.Predicate;
 import java.util.function.ToDoubleFunction;
 import java.util.function.UnaryOperator;
 
-public interface DataAPI {
+public interface DataAPI extends AutoCloseable {
     // Player fields
     <T> T get(UUID player, PlayerField<T> field);
     <T> void set(UUID player, PlayerField<T> field, T value);
     <T> void update(UUID player, PlayerField<T> field, UnaryOperator<T> updater);
+    <T> void update(UUID player, PlayerField<T> field, UnaryOperator<T> updater, UpdateMode mode);
 
     // Linked fields (resolves via player's link key)
     <K, T> T get(UUID player, LinkedField<K, T> field);
     <K, T> void set(UUID player, LinkedField<K, T> field, T value);
     <K, T> void update(UUID player, LinkedField<K, T> field, UnaryOperator<T> updater);
+    <K, T> void update(UUID player, LinkedField<K, T> field, UnaryOperator<T> updater, UpdateMode mode);
 
     // Direct linked access (when you have the key)
     <K, T> T getDirect(K key, LinkedField<K, T> field);
     <K, T> void setDirect(K key, LinkedField<K, T> field, T value);
     <K, T> void updateDirect(K key, LinkedField<K, T> field, UnaryOperator<T> updater);
+    <K, T> void updateDirect(K key, LinkedField<K, T> field, UnaryOperator<T> updater, UpdateMode mode);
 
     // Link management
     <K> void link(UUID player, LinkType<K> type, K key);
@@ -85,10 +89,16 @@ public interface DataAPI {
     // Lifecycle - warm a player's data into this node before use, evict it when done.
     // This is the primitive a proxy uses to load a player's data on the target server
     // BEFORE moving them there, and to evict it afterwards so a later visit is never stale.
+    // The async variants share one in-flight operation per player and stay ordered with each other.
     void load(UUID player);
     CompletableFuture<Void> loadAsync(UUID player, Executor executor);
+    default CompletableFuture<Void> loadAsync(UUID player) { return loadAsync(player, ForkJoinPool.commonPool()); }
     void flush(UUID player);
+    CompletableFuture<Void> flushAsync(UUID player, Executor executor);
+    default CompletableFuture<Void> flushAsync(UUID player) { return flushAsync(player, ForkJoinPool.commonPool()); }
     void unload(UUID player);
+    CompletableFuture<Void> unloadAsync(UUID player, Executor executor);
+    default CompletableFuture<Void> unloadAsync(UUID player) { return unloadAsync(player, ForkJoinPool.commonPool()); }
     boolean isLoaded(UUID player);
     Set<UUID> loadedPlayers();
 
@@ -98,6 +108,15 @@ public interface DataAPI {
     <K> void unloadLink(LinkType<K> type, K key);
     <K> boolean isLinkLoaded(LinkType<K> type, K key);
 
+    /**
+     * Deletes a shared entity outright: its document is removed from storage, every player linked
+     * to it is unlinked (here and on every other node), and the cached container is evicted
+     * cluster-wide. Unlinking the last member does not do this — the document is shared state that
+     * outlives its members — so a coop that is disbanded needs this or it lingers in storage
+     * forever.
+     */
+    <K> void deleteLink(LinkType<K> type, K key);
+
     // Distributed locking - takes the configured DistributedLock for an app-level critical section
     // that spans more than one field or entity. Use with try-with-resources; requires a lock to
     // have been supplied to the implementation.
@@ -105,4 +124,7 @@ public interface DataAPI {
 
     // Flushes deferred writes, stops expiration timers and closes pub/sub subscribers.
     void shutdown();
+
+    @Override
+    default void close() { shutdown(); }
 }

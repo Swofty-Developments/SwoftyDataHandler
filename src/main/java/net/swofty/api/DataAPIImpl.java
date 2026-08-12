@@ -6,6 +6,8 @@ import net.swofty.data.format.JsonFormat;
 import net.swofty.event.*;
 import net.swofty.lock.DistributedLock;
 import net.swofty.storage.DataStorage;
+import net.swofty.storage.SaveResult;
+import net.swofty.storage.StorageOwnership;
 import net.swofty.transaction.TransactionConsumer;
 import net.swofty.transaction.TransactionFunction;
 
@@ -13,11 +15,16 @@ import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 import java.util.function.ToDoubleFunction;
 import java.util.function.UnaryOperator;
 
 public class DataAPIImpl implements DataAPI {
+    /** How long a transaction or a distributed update waits for the entity's lock by default. */
+    public static final Duration DEFAULT_LOCK_TIMEOUT = Duration.ofSeconds(10);
+
     private final DataStorage storage;
     private final PlayerDataManager playerData;
     private final LinkedDataManager linkedData;
@@ -27,6 +34,9 @@ public class DataAPIImpl implements DataAPI {
     private final EventBus eventBus;
     private final BulkOperationExecutor bulkOperations;
     private final DistributedLock distributedLock;
+    private final StorageOwnership storageOwnership;
+    private final Duration lockTimeout;
+    private final AtomicBoolean shutdown = new AtomicBoolean();
 
     public DataAPIImpl(DataStorage storage, DataFormat format, PubSubHandler pubSub) {
         this(storage, format, pubSub, true);
@@ -45,7 +55,21 @@ public class DataAPIImpl implements DataAPI {
      */
     public DataAPIImpl(DataStorage storage, DataFormat format, PubSubHandler pubSub, boolean autoPersist,
                        DistributedLock distributedLock) {
+        this(storage, format, pubSub, autoPersist, distributedLock, StorageOwnership.BORROWED, DEFAULT_LOCK_TIMEOUT);
+    }
+
+    /**
+     * @param ownership   OWNED makes {@link #shutdown()} close the storage (and the distributed lock,
+     *                    when it is closeable) as well; BORROWED, the default, leaves both alone
+     *                    because the application may still be using them.
+     * @param lockTimeout how long transactions and {@link UpdateMode#DISTRIBUTED} writes wait for an
+     *                    entity's distributed lock before giving up.
+     */
+    public DataAPIImpl(DataStorage storage, DataFormat format, PubSubHandler pubSub, boolean autoPersist,
+                       DistributedLock distributedLock, StorageOwnership ownership, Duration lockTimeout) {
         this.storage = storage;
+        this.storageOwnership = Objects.requireNonNull(ownership, "ownership");
+        this.lockTimeout = Objects.requireNonNull(lockTimeout, "lockTimeout");
         this.distributedLock = distributedLock;
         this.eventBus = (pubSub != null) ? new DistributedEventBus(pubSub) : new EventBus();
         this.linkRegistry = new LinkRegistryImpl();
@@ -56,7 +80,7 @@ public class DataAPIImpl implements DataAPI {
         this.linkedData = new LinkedDataManager(storage, format, eventBus, linkRegistry, autoPersist);
         this.expirationManager = new ExpirationManager(eventBus);
         this.transactionManager = new TransactionManager(playerData, linkedData, linkRegistry, eventBus,
-                distributedLock, Duration.ofSeconds(10));
+                distributedLock, lockTimeout, this);
         this.bulkOperations = new BulkOperationExecutor(playerData, linkedData, storage, eventBus);
 
         // Keep locally cached containers coherent with changes made on other nodes.
@@ -83,6 +107,42 @@ public class DataAPIImpl implements DataAPI {
                     linkRegistry.unlink(player, type);
                     playerData.applyRemote(type.playerField(), player, null);
                 }
+
+                @Override
+                public void onPlayerSnapshot(UUID player, long version) {
+                    // A snapshot replaces the whole document, links included, so the registry has to
+                    // be re-derived from it or this node keeps resolving a link the document dropped.
+                    if (playerData.applyRemoteSnapshot(player, version)) {
+                        linkRegistry.reconcile(player);
+                    }
+                }
+
+                @Override
+                public void onLinkedSnapshot(String linkTypeName, String linkKey, long version) {
+                    linkedData.applyRemoteSnapshot(linkTypeName, linkKey, version);
+                }
+
+                @Override
+                public boolean isPlayerCached(UUID player) {
+                    return playerData.isLoaded(player);
+                }
+
+                @Override
+                public boolean isLinkedCached(String linkTypeName, String linkKey) {
+                    return linkedData.isLinkedLoaded(linkTypeName, linkKey);
+                }
+
+                @Override
+                public <K> Set<UUID> onLinkedDeleted(LinkType<K> type, K linkKey) {
+                    Set<UUID> affected = new HashSet<>(linkRegistry.getLinkedPlayers(type, linkKey));
+                    for (UUID player : affected) {
+                        linkRegistry.unlink(player, type);
+                        playerData.applyRemote(type.playerField(), player, null);
+                    }
+                    expirationManager.clearLinked(type.name(), linkKey);
+                    linkedData.evict(type.name(), linkKey);
+                    return affected;
+                }
             });
         }
     }
@@ -97,6 +157,10 @@ public class DataAPIImpl implements DataAPI {
 
     public DataAPIImpl(DataStorage storage, PubSubHandler pubSub) {
         this(storage, new JsonFormat(), pubSub);
+    }
+
+    public DataAPIImpl(DataStorage storage, StorageOwnership ownership) {
+        this(storage, new JsonFormat(), null, true, null, ownership, DEFAULT_LOCK_TIMEOUT);
     }
 
     // ==================== Player Fields ====================
@@ -114,6 +178,16 @@ public class DataAPIImpl implements DataAPI {
     @Override
     public <T> void update(UUID player, PlayerField<T> field, UnaryOperator<T> updater) {
         playerData.update(player, field, updater);
+    }
+
+    @Override
+    public <T> void update(UUID player, PlayerField<T> field, UnaryOperator<T> updater, UpdateMode mode) {
+        if (mode != UpdateMode.DISTRIBUTED) {
+            playerData.update(player, field, updater);
+            return;
+        }
+        underEntityLock("player:" + player, playerData.getLock(player), () -> playerData.refresh(player),
+                () -> playerData.update(player, field, updater));
     }
 
     // ==================== Linked Fields ====================
@@ -134,6 +208,15 @@ public class DataAPIImpl implements DataAPI {
     }
 
     @Override
+    public <K, T> void update(UUID player, LinkedField<K, T> field, UnaryOperator<T> updater, UpdateMode mode) {
+        K key = linkRegistry.resolve(player, field.linkType());
+        if (key == null) {
+            throw new IllegalStateException("Player " + player + " is not linked to " + field.linkType().name());
+        }
+        updateDirect(key, field, updater, mode);
+    }
+
+    @Override
     public <K, T> T getDirect(K key, LinkedField<K, T> field) {
         return linkedData.getDirect(key, field, expirationManager);
     }
@@ -148,14 +231,67 @@ public class DataAPIImpl implements DataAPI {
         linkedData.updateDirect(key, field, updater);
     }
 
+    @Override
+    public <K, T> void updateDirect(K key, LinkedField<K, T> field, UnaryOperator<T> updater, UpdateMode mode) {
+        if (mode != UpdateMode.DISTRIBUTED) {
+            linkedData.updateDirect(key, field, updater);
+            return;
+        }
+        String ck = LinkedDataManager.compositeKey(field.linkType().name(), key);
+        underEntityLock("linked:" + ck, linkedData.getLock(ck),
+                () -> linkedData.refresh(field.linkType().name(), key),
+                () -> linkedData.updateDirect(key, field, updater));
+    }
+
+    /**
+     * Runs a read-modify-write under the entity's cross-node lock.
+     *
+     * <p>Already inside that lock (a transaction on the same entity, or a nested distributed
+     * update) the lock is not taken again: it is not reentrant, so re-acquiring it would block
+     * until the acquisition timed out. Wanting a *different* entity's lock while holding one is
+     * refused outright rather than attempted, because two nodes doing that in opposite orders
+     * deadlock each other until both leases expire; take {@link #lock(String, Duration)} explicitly
+     * in a fixed order instead.
+     */
+    private void underEntityLock(String lockKey, Object monitor, Runnable refresh, Supplier<SaveResult> write) {
+        requireDistributedLock();
+        if (LockScope.holdsKey(distributedLock, lockKey)) {
+            synchronized (monitor) {
+                // Riding a lock this thread already holds. The reread is skipped only when this same
+                // API took it: another DataAPIImpl sharing this lock generates the same key for the
+                // same player, but it reread its own document, not this one's.
+                if (!LockScope.holdsKeyForOwner(distributedLock, lockKey, this)) refresh.run();
+                write.get();
+            }
+            return;
+        }
+        if (LockScope.holdsOtherKey(distributedLock, lockKey)) {
+            throw new IllegalStateException("Cannot take the distributed lock for " + lockKey
+                    + " while this thread holds " + LockScope.describeHeld(distributedLock)
+                    + "; use lock(key, timeout) explicitly if you need more than one entity");
+        }
+        try (DistributedLock.Handle handle = distributedLock.acquire(lockKey, lockTimeout)) {
+            synchronized (monitor) {
+                LockScope.enter(distributedLock, lockKey, this);
+                try {
+                    refresh.run();
+                    write.get();
+                    handle.ensureValid();
+                } finally {
+                    LockScope.exit(distributedLock, lockKey, this);
+                }
+            }
+        }
+    }
+
     // ==================== Link Management ====================
 
     @Override
     public <K> void link(UUID player, LinkType<K> type, K key) {
         synchronized (playerData.getLock(player)) {
             linkRegistry.link(player, type, key);
-            playerData.setFieldValue(player, type.playerField(), key);
-            eventBus.fireLinked(type, player, key);
+            SaveResult saved = playerData.setFieldValue(player, type.playerField(), key);
+            eventBus.fireLinked(type, player, key, PlayerDataManager.eventVersion(saved));
         }
     }
 
@@ -164,8 +300,8 @@ public class DataAPIImpl implements DataAPI {
         synchronized (playerData.getLock(player)) {
             K previousKey = linkRegistry.unlink(player, type);
             if (previousKey == null) return;
-            playerData.setFieldValue(player, type.playerField(), null);
-            eventBus.fireUnlinked(type, player, previousKey);
+            SaveResult saved = playerData.setFieldValue(player, type.playerField(), null);
+            eventBus.fireUnlinked(type, player, previousKey, PlayerDataManager.eventVersion(saved));
         }
     }
 
@@ -186,9 +322,9 @@ public class DataAPIImpl implements DataAPI {
         Validation.validate(field, value);
         synchronized (playerData.getLock(player)) {
             T oldValue = playerData.getFieldValue(player, field);
-            playerData.setFieldValue(player, field, value);
+            SaveResult saved = playerData.setFieldValue(player, field, value);
             expirationManager.setExpiration(player, field, ttl, value);
-            eventBus.firePlayerDataChanged(field, player, oldValue, value);
+            eventBus.firePlayerDataChanged(field, player, oldValue, value, PlayerDataManager.eventVersion(saved));
         }
     }
 
@@ -222,10 +358,11 @@ public class DataAPIImpl implements DataAPI {
         String ck = LinkedDataManager.compositeKey(field.linkType().name(), linkKey);
         synchronized (linkedData.getLock(ck)) {
             T oldValue = linkedData.getFieldValue(field.linkType().name(), linkKey, field);
-            linkedData.setFieldValue(field.linkType().name(), linkKey, field, value);
+            SaveResult saved = linkedData.setFieldValue(field.linkType().name(), linkKey, field, value);
             Set<UUID> affected = linkRegistry.getLinkedPlayers(field.linkType(), linkKey);
             expirationManager.setLinkedExpiration(field, linkKey, ttl, value, affected);
-            eventBus.fireLinkedDataChanged(field, linkKey, oldValue, value, affected);
+            eventBus.fireLinkedDataChanged(field, linkKey, oldValue, value, affected,
+                    PlayerDataManager.eventVersion(saved));
         }
     }
 
@@ -339,7 +476,7 @@ public class DataAPIImpl implements DataAPI {
 
     @Override
     public CompletableFuture<Void> loadAsync(UUID player, Executor executor) {
-        return CompletableFuture.runAsync(() -> playerData.load(player), executor);
+        return playerData.loadAsync(player, executor);
     }
 
     @Override
@@ -348,8 +485,18 @@ public class DataAPIImpl implements DataAPI {
     }
 
     @Override
+    public CompletableFuture<Void> flushAsync(UUID player, Executor executor) {
+        return playerData.flushAsync(player, executor);
+    }
+
+    @Override
     public void unload(UUID player) {
         playerData.unload(player);
+    }
+
+    @Override
+    public CompletableFuture<Void> unloadAsync(UUID player, Executor executor) {
+        return playerData.unloadAsync(player, executor);
     }
 
     @Override
@@ -378,6 +525,18 @@ public class DataAPIImpl implements DataAPI {
     }
 
     @Override
+    public <K> void deleteLink(LinkType<K> type, K key) {
+        // Unlink the members first: each of those is a write to a player document that has to
+        // happen whether or not the shared document deletion below succeeds.
+        for (UUID player : new HashSet<>(linkRegistry.getLinkedPlayers(type, key))) {
+            unlink(player, type);
+        }
+        expirationManager.clearLinked(type.name(), key);
+        linkedData.deleteLinked(type.name(), key);
+        eventBus.fireLinkDeleted(type, key);
+    }
+
+    @Override
     public <K> boolean isLinkLoaded(LinkType<K> type, K key) {
         return linkedData.isLinkedLoaded(type.name(), key);
     }
@@ -389,20 +548,44 @@ public class DataAPIImpl implements DataAPI {
      */
     @Override
     public DistributedLock.Handle lock(String key, Duration timeout) {
+        requireDistributedLock();
+        return distributedLock.acquire(key, timeout);
+    }
+
+    private void requireDistributedLock() {
         if (distributedLock == null) {
             throw new IllegalStateException("No DistributedLock configured on this DataAPI");
         }
-        return distributedLock.acquire(key, timeout);
     }
 
     @Override
     public void shutdown() {
-        // Flush any deferred writes so nothing is lost on a clean shutdown.
-        playerData.flushAll();
-        linkedData.flushAll();
-        expirationManager.shutdown();
+        if (!shutdown.compareAndSet(false, true)) return;
+        // Every stage runs even if an earlier one fails, so one broken subsystem cannot leak the
+        // threads and connections held by the rest.
+        RuntimeException failure = null;
+        try { playerData.flushAll(); } catch (RuntimeException e) { failure = e; }
+        try { linkedData.flushAll(); } catch (RuntimeException e) { failure = suppress(failure, e); }
+        try { expirationManager.shutdown(); } catch (RuntimeException e) { failure = suppress(failure, e); }
         if (eventBus instanceof DistributedEventBus deb) {
-            deb.shutdown();
+            try { deb.shutdown(); } catch (RuntimeException e) { failure = suppress(failure, e); }
         }
+        if (storageOwnership == StorageOwnership.OWNED) {
+            try { storage.close(); } catch (Exception e) { failure = suppress(failure, asRuntime(e)); }
+            if (distributedLock instanceof AutoCloseable closeable) {
+                try { closeable.close(); } catch (Exception e) { failure = suppress(failure, asRuntime(e)); }
+            }
+        }
+        if (failure != null) throw failure;
+    }
+
+    private static RuntimeException suppress(RuntimeException first, RuntimeException next) {
+        if (first == null) return next;
+        first.addSuppressed(next);
+        return first;
+    }
+
+    private static RuntimeException asRuntime(Exception e) {
+        return e instanceof RuntimeException runtime ? runtime : new IllegalStateException(e);
     }
 }

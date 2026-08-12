@@ -52,6 +52,10 @@ public class EventBus {
         }
     }
 
+    public <T> void firePlayerDataChanged(DataField<T> field, UUID player, T oldValue, T newValue, long version) {
+        firePlayerDataChanged(field, player, oldValue, newValue);
+    }
+
     @SuppressWarnings("unchecked")
     public <K, T> void fireLinkedDataChanged(DataField<T> field, K linkKey, T oldValue, T newValue, Set<UUID> affected) {
         List<LinkedDataListener<?, ?>> listeners = linkedListeners.get(field.fullKey());
@@ -61,6 +65,11 @@ public class EventBus {
                         ((LinkedDataListener<K, T>) listener).onChanged(linkKey, oldValue, newValue, affected));
             }
         }
+    }
+
+    public <K, T> void fireLinkedDataChanged(DataField<T> field, K linkKey, T oldValue, T newValue,
+                                              Set<UUID> affected, long version) {
+        fireLinkedDataChanged(field, linkKey, oldValue, newValue, affected);
     }
 
     @SuppressWarnings("unchecked")
@@ -73,6 +82,10 @@ public class EventBus {
         }
     }
 
+    public <K> void fireLinked(LinkType<K> type, UUID player, K linkKey, long version) {
+        fireLinked(type, player, linkKey);
+    }
+
     @SuppressWarnings("unchecked")
     public <K> void fireUnlinked(LinkType<K> type, UUID player, K previousKey) {
         List<LinkChangeListener<?>> listeners = linkChangeListeners.get(type.name());
@@ -81,6 +94,10 @@ public class EventBus {
                 dispatch(type.name(), () -> ((LinkChangeListener<K>) listener).onUnlinked(player, type, previousKey));
             }
         }
+    }
+
+    public <K> void fireUnlinked(LinkType<K> type, UUID player, K previousKey, long version) {
+        fireUnlinked(type, player, previousKey);
     }
 
     @SuppressWarnings("unchecked")
@@ -104,6 +121,29 @@ public class EventBus {
             }
         }
     }
+
+    /** Signals that deferred changes were durably flushed as one document snapshot. */
+    public void firePlayerSnapshotSaved(UUID player, long version) {}
+
+    /** Signals that deferred linked changes were durably flushed as one document snapshot. */
+    public void fireLinkedSnapshotSaved(String linkTypeName, Object linkKey, long version) {}
+
+    /** Signals that a shared entity's document was deleted outright. */
+    public <K> void fireLinkDeleted(LinkType<K> type, K linkKey) {}
+
+    /**
+     * Records the version of a whole document this node has just read, so every event older than it
+     * is known to be already included and can be rejected on arrival.
+     */
+    public void rememberPlayerDocument(UUID player, long version) {}
+
+    public void rememberLinkedDocument(String linkTypeName, Object linkKey, long version) {}
+
+    /** Drops the per-entity ordering state kept for a player this node no longer caches. */
+    public void forgetPlayer(UUID player) {}
+
+    /** Drops the per-entity ordering state kept for a shared entity this node no longer caches. */
+    public void forgetLinked(String linkTypeName, Object linkKey) {}
 
     /**
      * Runs one listener in isolation. A listener that throws must not swallow the remaining

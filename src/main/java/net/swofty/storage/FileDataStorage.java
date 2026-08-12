@@ -43,13 +43,52 @@ public class FileDataStorage implements DataStorage {
     }
 
     @Override
-    public void save(String type, String id, byte[] data) {
+    public synchronized void save(String type, String id, byte[] data) {
+        write(type, id, data, readVersion(type, id) + 1);
+    }
+
+    // Only a single JVM's writers are serialised here, so the compare and the write are atomic
+    // for this process and no further. Two processes over one directory still race.
+    @Override
+    public synchronized SaveResult saveIfVersion(String type, String id, byte[] data, long expectedVersion) {
+        long current = readVersion(type, id);
+        if (current != expectedVersion) return SaveResult.conflict(type, id, current);
+        long version = current + 1;
+        write(type, id, data, version);
+        return SaveResult.saved(type, id, version);
+    }
+
+    @Override
+    public synchronized VersionedData loadVersioned(String type, String id) {
+        return new VersionedData(load(type, id), readVersion(type, id));
+    }
+
+    private void write(String type, String id, byte[] data, long version) {
         Path path = resolvePath(type, id);
         try {
             Files.createDirectories(path.getParent());
             Files.write(path, data);
+            Files.writeString(versionPath(type, id), Long.toString(version));
         } catch (IOException e) {
             throw new UncheckedIOException(e);
+        }
+    }
+
+    // The version lives beside the document rather than inside it, because the document bytes are
+    // the consumer's on-disk format and must stay byte-for-byte what the codecs wrote.
+    private Path versionPath(String type, String id) {
+        return baseDir.resolve(type).resolve(id + extension + ".version");
+    }
+
+    private long readVersion(String type, String id) {
+        Path path = versionPath(type, id);
+        if (!Files.exists(path)) return VersionedData.UNVERSIONED;
+        try {
+            return Long.parseLong(Files.readString(path).trim());
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        } catch (NumberFormatException corrupt) {
+            return VersionedData.UNVERSIONED;
         }
     }
 
@@ -77,6 +116,7 @@ public class FileDataStorage implements DataStorage {
         Path path = resolvePath(type, id);
         try {
             Files.deleteIfExists(path);
+            Files.deleteIfExists(versionPath(type, id));
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }

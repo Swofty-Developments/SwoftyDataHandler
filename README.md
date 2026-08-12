@@ -54,6 +54,17 @@ api.update(player, COINS, c -> c + 100);
 int coins = api.get(player, COINS); // 600
 ```
 
+Writes are synchronous and durable by default: when `set` returns, the document is in storage. A
+storage failure is thrown to the caller rather than reported to a future nobody is watching.
+
+The lifecycle operations also have async forms, which share one in-flight operation per player:
+
+```java
+api.loadAsync(player);       // concurrent calls for this player share one in-flight load
+api.flushAsync(player);      // queued behind an in-flight load for the same player
+api.unloadAsync(player);
+```
+
 ## Storage Backends
 
 | Backend | Persistence | Shared across servers | Indexed leaderboards |
@@ -81,6 +92,62 @@ new RedisDataStorage(pool, "myapp:data") // custom key prefix
 new MongoDataStorage(mongoClient, "myapp")
 ```
 
+Storage ownership is explicit. Constructors default to `StorageOwnership.BORROWED`; choose
+`OWNED` when `DataAPI.shutdown()` should also close the storage (and the distributed lock, if it is
+closeable) along with its client/pool:
+
+```java
+DataAPI api = new DataAPIImpl(storage, StorageOwnership.OWNED);
+```
+
+### Concurrent writes to one document
+
+A player or shared entity is one document, and two nodes can legitimately write different fields of
+it at the same time. Each node serialises its own view over the document it last read, so a plain
+write would erase whatever the other node had just put there.
+
+Every write is therefore conditional on the document version the node last read
+(`DataStorage.saveIfVersion`), and losing that race is not an error: the node rereads the winner's
+document, replays only its own unsaved fields onto it and writes again. Both fields survive, with
+no coordination, no lock and no pub/sub message required.
+
+| Backend | Version source | Comparison |
+|---------|----------------|------------|
+| `RedisDataStorage` | `<prefix>:version:<type>:<id>` counter | one Lua script: compare, bump, write, index |
+| `MongoDataStorage` | `version` field | `findOneAndUpdate` filtered on the version, `$inc` |
+| `InMemoryDataStorage` | per-key counter | compare and write under the key's monitor |
+| `FileDataStorage` | `<id><ext>.version` sidecar | compare and write under the instance monitor (one JVM only) |
+
+A write is never forced over the stored document. Giving up by overwriting would erase whatever a
+peer wrote in the meantime, which is the exact bug the comparison exists to prevent and is likeliest
+precisely when contention is high. Retries back off with jitter and log at `WARNING` if a document
+keeps losing.
+
+Contention alone resolves itself, because every conflict means another writer committed and the
+retry follows them. What does not resolve itself is a backend whose reads and writes disagree about
+what is stored — a failover to a lagging replica, where the reread keeps returning a version the
+write then rejects. Retrying is bounded by a generous time budget (a minute) for that case, after
+which the write throws `WriteConflictException` naming the document and the attempt count. The write
+did not happen, and nothing was overwritten to hide that.
+
+**What this does and does not give you.** Concurrent writes to *different* fields of one document
+both survive. Concurrent read-modify-write of the *same* field is still last-writer-wins: two nodes
+that read `coins = 10` and both write `11` merge cleanly to `11`, because merging is per field and
+neither node knows the other counted. If a field must be incremented from more than one node at
+once, serialise it:
+
+```java
+api.update(player, COINS, c -> c + 100, UpdateMode.DISTRIBUTED); // rereads under the entity's lock
+api.transaction(player, tx -> tx.update(COINS, c -> c + 100));   // same, for several fields at once
+```
+
+Both require a `DistributedLock` (see [Distributed Locking](#distributed-locking)); without one they
+serialise threads in this JVM only.
+
+A storage written against 1.4.x keeps working unchanged: `loadVersioned` and `saveIfVersion` are
+defaulted, and a backend that does not implement them reports "unversioned", which degrades every
+write to the 1.4.x last-writer-wins behaviour instead of pretending to be atomic.
+
 ## Player Fields
 
 Per-player data with type safety, default values, and optional validation.
@@ -102,6 +169,18 @@ int coins = api.get(player, COINS);
 ```
 
 All fields use a `namespace:key` format internally (e.g. `economy:coins`) to prevent collisions between systems.
+
+`defaultValue(x)` hands back exactly `x` every time it is read, which is what a shared immutable
+default should do — reading a field nobody has written is the hot path and must not allocate or
+decode. A **mutable** default must not be shared between entities, so declare it as a factory
+instead:
+
+```java
+PlayerField<List<String>> QUESTS = PlayerField.<List<String>>builder("profile", "quests")
+        .codec(Codecs.list(Codecs.STRING))
+        .defaultFactory(ArrayList::new)   // a fresh list per miss
+        .build();
+```
 
 ## Linked Fields (Shared Data)
 
@@ -337,6 +416,22 @@ apiB.subscribe(COINS, (p, old, nw) -> {
 Without a `PubSubHandler` (e.g. `new DataAPIImpl(storage)`) listeners are local to the process that
 made the change. `KeyDBPubSubHandler` is the same handler for KeyDB.
 
+**Ordering.** Messages can arrive out of order, so each field of each entity carries the document
+version its write produced, and a receiver drops an event older than one it has already applied to
+that same field. The gate is per field, not per document: one transaction writes several fields at
+a single document version, and two nodes routinely write different fields at versions that arrive
+in either order — a per-document gate would silently drop all but the first field of every
+transaction. A node that defers its writes has no durable version to order by, so its events are
+published unversioned and always delivered; its later `flush` publishes a snapshot notice that
+makes peers reread the whole document.
+
+The per-entity ordering state is dropped when the entity is unloaded, and capped so a node that
+only ever *hears* about entities cannot grow without bound. The cap never reaches an entity that is
+currently loaded here: dropping the ordering state for a player this node is serving would let a
+replayed older event revert them, and the next local write would make that durable. So the bound is
+"4096 entities this node does not cache, plus however many it does" — the latter being bounded by
+the node itself.
+
 ## Bulk Operations
 
 ### Leaderboards
@@ -421,6 +516,19 @@ api.loadLink(ISLAND, islandId);
 api.unloadLink(ISLAND, islandId);
 ```
 
+**Deleting a shared entity.** Unlinking the last member does not delete the entity — members come
+and go, and the document is shared state that outlives them — so an island or coop that is actually
+disbanded has to be ended explicitly, or its document stays in storage forever:
+
+```java
+api.deleteLink(ISLAND, islandId);
+```
+
+That removes the document from storage, unlinks every player still linked to it (clearing the link
+key on their own documents and firing the usual unlink events), drops any expirations registered
+against it, and tells every other node to unlink its players and evict its cached copy. Afterwards
+`getDirect` on that key reads the fields' defaults.
+
 This is the primitive a proxy uses to implement "load the player's data on the target server
 *before* moving them there": the proxy asks the destination to `load(player)`, waits for the
 ack, then connects the player. Because the origin calls `unload(player)` on disconnect, the
@@ -436,7 +544,13 @@ DataAPI api = new DataAPIImpl(storage, new JsonFormat(), pubSub, /* autoPersist 
 
 **Cache coherency.** With a distributed event bus, a change made on another node to an entity that
 is currently loaded here updates the local view in place, so subscribed fields never go stale
-while a player is online. Eviction on `unload` handles the general case.
+while a player is online. Eviction on `unload` handles the general case. Applying a peer's field
+does not make this node claim the peer's document version — it saw one field, not the whole
+document — so its next write still compare-and-sets against the version it genuinely holds.
+
+A snapshot notice (from a peer's `flush`/`unload`) replaces the whole document here, links included,
+so the link registry is re-derived from it: a player another node moved out of a coop stops
+resolving to that coop here too.
 
 ## Distributed Locking
 
@@ -458,7 +572,59 @@ try (var handle = api.lock("coop-transfer:" + coopId, Duration.ofSeconds(5))) {
 ```
 
 The Redis implementation uses `SET NX PX` with a compare-and-delete release, so a lock is only
-released by its owner and a lease bounds a crashed holder.
+released by its owner and a lease bounds a crashed holder. A held lock renews its lease in the
+background from a single shared scheduler, so work that legitimately outlives the lease does not
+lose it halfway through.
+
+Renewal can still fail — the process stalls, the connection breaks, the key is force-deleted — and
+`Handle.isValid()` / `Handle.ensureValid()` report that. **`ensureValid()` is best-effort**: it says
+the lease was still held a moment ago, not that it will still be held while the next write lands.
+
+`Handle.fencingToken()` increases for successive holders of a key, and keeps increasing even after
+the fence counter is reclaimed (it expires after a long idle window rather than living forever),
+because a fresh counter is seeded from the wall clock rather than from zero — so it does not require
+node clocks to agree, only that none of them runs backwards across that window. **The library never enforces the token on its own writes.** If you
+want fencing, you have to compare it yourself at your own storage layer. What protects data across
+nodes here is the compare-and-set write path above, which is enforced unconditionally and needs no
+lock at all.
+
+`RedisDistributedLock` owns a daemon thread for renewals. A `BORROWED` lock (the default) is left
+alone by `shutdown()`, so that thread lives until you call `close()` on the lock yourself, or hand
+it to the API as `OWNED`.
+
+How long a transaction (or a `DISTRIBUTED` write, below) waits for an entity's lock is
+configurable, and defaults to 10 seconds:
+
+```java
+DataAPI api = new DataAPIImpl(storage, new JsonFormat(), pubSub, true, lock,
+        StorageOwnership.BORROWED, Duration.ofSeconds(3));
+```
+
+### Locked single-field writes
+
+A transaction is the general tool, but a single read-modify-write across nodes can ask for the same
+protection directly:
+
+```java
+api.update(player, COINS, c -> c + 100, UpdateMode.DISTRIBUTED);
+api.updateDirect(coopId, BANK, b -> b - 1000L, UpdateMode.DISTRIBUTED);
+```
+
+`UpdateMode.LOCAL` (the default for the overloads without a mode) takes only the JVM-local monitor.
+`DISTRIBUTED` takes the entity's cross-node lock, rereads the entity under it, then writes.
+
+A distributed lock is not reentrant, so a `DISTRIBUTED` write **inside a transaction on the same
+entity** rides the lock the transaction already holds instead of deadlocking against itself. Asking
+for a *different* entity's lock while holding one throws `IllegalStateException` immediately rather
+than waiting for a timeout, because two nodes doing that in opposite orders deadlock each other
+until both leases expire; take `api.lock(key, timeout)` explicitly, in a fixed order, if you need
+more than one entity.
+
+Both behaviours are tracked per `DistributedLock` **instance**. Several `DataAPIImpl`s sharing one
+lock instance (the usual arrangement, one lock per Redis) see each other's held keys, and a write on
+one of them still rereads its own document before writing even while riding a lock another took. Two
+separate lock objects pointed at the same Redis and prefix are one lock service but two instances,
+and are not tracked as one: share the instance.
 
 A lock alone does not prevent a lost update: it serialises writers, but a node could still take it
 and then compute its new value from a cached copy a peer had already overwritten. So with a
@@ -498,6 +664,9 @@ Always shut down the API when done:
 api.shutdown(); // flushes deferred writes, stops expiration timers, closes Pub/Sub subscribers
 ```
 
+`shutdown()` is idempotent, and every stage runs even if an earlier one fails, so one broken
+subsystem cannot leak the threads and connections held by the rest.
+
 For Redis storage, also close the storage:
 
 ```java
@@ -506,6 +675,15 @@ DataAPI api = new DataAPIImpl(storage);
 // ...
 api.shutdown();
 storage.close();
+```
+
+Or hand ownership to the API and let `shutdown()` (or try-with-resources — `DataAPI` is
+`AutoCloseable`) close both:
+
+```java
+try (DataAPI api = new DataAPIImpl(storage, StorageOwnership.OWNED)) {
+    // ...
+}
 ```
 
 ## License

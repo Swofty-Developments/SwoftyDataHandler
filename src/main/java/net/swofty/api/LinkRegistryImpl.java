@@ -8,6 +8,9 @@ import java.util.concurrent.ConcurrentHashMap;
 class LinkRegistryImpl {
     private final ConcurrentHashMap<UUID, Map<String, Object>> playerLinks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Set<UUID>> reverseIndex = new ConcurrentHashMap<>();
+    // Every link type this node has been handed, so a document reread can be reconciled against
+    // all of them rather than only against the links this node happens to have cached.
+    private final ConcurrentHashMap<String, LinkType<?>> knownTypes = new ConcurrentHashMap<>();
 
     private volatile LinkKeyLoader keyLoader;
 
@@ -25,6 +28,7 @@ class LinkRegistryImpl {
     }
 
     public <K> void link(UUID player, LinkType<K> type, K key) {
+        knownTypes.putIfAbsent(type.name(), type);
         playerLinks.computeIfAbsent(player, k -> new ConcurrentHashMap<>())
                 .put(type.name(), key);
         String ck = LinkedDataManager.compositeKey(type.name(), key);
@@ -33,6 +37,7 @@ class LinkRegistryImpl {
 
     @SuppressWarnings("unchecked")
     public <K> K unlink(UUID player, LinkType<K> type) {
+        knownTypes.putIfAbsent(type.name(), type);
         Map<String, Object> links = playerLinks.get(player);
         if (links == null) return null;
 
@@ -52,6 +57,7 @@ class LinkRegistryImpl {
 
     @SuppressWarnings("unchecked")
     public <K> K resolve(UUID player, LinkType<K> type) {
+        knownTypes.putIfAbsent(type.name(), type);
         Map<String, Object> links = playerLinks.get(player);
         K key = links == null ? null : (K) links.get(type.name());
         return key != null ? key : rehydrate(player, type);
@@ -79,7 +85,27 @@ class LinkRegistryImpl {
     }
 
     public <K> Set<UUID> getLinkedPlayers(LinkType<K> type, K key) {
+        knownTypes.putIfAbsent(type.name(), type);
         String ck = LinkedDataManager.compositeKey(type.name(), key);
         return reverseIndex.getOrDefault(ck, Collections.emptySet());
+    }
+
+    /**
+     * Rebuilds a player's links from what their document now says, after the document was replaced
+     * by one another node wrote. Links live on the player's own document, so a reread that silently
+     * left this registry alone would keep resolving a coop the player has already left.
+     */
+    @SuppressWarnings("unchecked")
+    void reconcile(UUID player) {
+        LinkKeyLoader loader = this.keyLoader;
+        if (loader == null) return;
+        for (LinkType<?> raw : knownTypes.values()) {
+            LinkType<Object> type = (LinkType<Object>) raw;
+            Object stored = loader.load(player, type);
+            Object cached = resolve(player, type.name());
+            if (Objects.equals(stored, cached)) continue;
+            if (cached != null) unlink(player, type);
+            if (stored != null) link(player, type, stored);
+        }
     }
 }
