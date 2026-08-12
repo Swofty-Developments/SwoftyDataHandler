@@ -248,13 +248,33 @@ class TransactionManager {
         void rollback() {
             if (committed || rolledBack) return;
             rolledBack = true;
-            DataContainer playerContainer = playerData.getContainer(player);
-            for (Map.Entry<String, Object> entry : originalPlayerValues.entrySet()) {
-                if (entry.getValue() == null) {
-                    playerContainer.rawData().remove(entry.getKey());
-                } else {
-                    playerContainer.rawData().put(entry.getKey(), entry.getValue());
+
+            if (player != null) {
+                DataContainer playerContainer = playerData.getContainer(player);
+                for (Map.Entry<String, Object> entry : originalPlayerValues.entrySet()) {
+                    restore(playerContainer, entry.getKey(), entry.getValue());
                 }
+            }
+
+            for (Map.Entry<String, Object> entry : originalLinkedValues.entrySet()) {
+                String lk = entry.getKey();
+                int colonIdx = lk.indexOf(':');
+                String linkTypeName = lk.substring(0, colonIdx);
+                String fieldFullKey = lk.substring(colonIdx + 1);
+
+                Object linkKey = resolveLink(linkTypeName);
+                if (linkKey == null) continue;
+                DataContainer container = linkedData.getContainer(
+                        LinkedDataManager.compositeKey(linkTypeName, linkKey));
+                restore(container, fieldFullKey, entry.getValue());
+            }
+        }
+
+        private void restore(DataContainer container, String fullKey, Object value) {
+            if (value == null) {
+                container.rawData().remove(fullKey);
+            } else {
+                container.rawData().put(fullKey, value);
             }
         }
     }

@@ -41,7 +41,7 @@ class LinkedDataManager {
         return linkTypeName + ":" + key;
     }
 
-    private DataContainer getContainer(String compositeKey) {
+    DataContainer getContainer(String compositeKey) {
         return cache.computeIfAbsent(compositeKey, k -> new DataContainer());
     }
 
