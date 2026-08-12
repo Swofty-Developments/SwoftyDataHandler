@@ -93,7 +93,7 @@ public class DistributedEventBus extends EventBus {
     public <K, T> void fireLinkedDataChanged(DataField<T> field, K linkKey, T oldValue, T newValue, Set<UUID> affected) {
         super.fireLinkedDataChanged(field, linkKey, oldValue, newValue, affected);
         publish(new EventMessage("LINKED_DATA_CHANGED", field.fullKey(), nodeId, Map.of(
-                "linkKey", linkKey.toString(),
+                "linkKey", serializeLinkKey(field, linkKey),
                 "oldValue", serializeValue(field.codec(), oldValue),
                 "newValue", serializeValue(field.codec(), newValue),
                 "affected", uuidSetToList(affected)
@@ -131,7 +131,7 @@ public class DistributedEventBus extends EventBus {
     public <K, T> void fireLinkedExpired(ExpiringLinkedField<K, T> field, K linkKey, T expiredValue, Set<UUID> memberIds) {
         super.fireLinkedExpired(field, linkKey, expiredValue, memberIds);
         publish(new EventMessage("LINKED_EXPIRED", field.fullKey(), nodeId, Map.of(
-                "linkKey", linkKey.toString(),
+                "linkKey", serializeLinkKey(field, linkKey),
                 "expiredValue", serializeValue(field.codec(), expiredValue),
                 "memberIds", uuidSetToList(memberIds)
         )));
@@ -180,14 +180,15 @@ public class DistributedEventBus extends EventBus {
     @SuppressWarnings("unchecked")
     private void handleLinkedDataChanged(EventMessage msg) {
         DataField<Object> field = (DataField<Object>) fieldRegistry.get(msg.fieldKey);
-        if (field == null) return;
-        String linkKey = (String) msg.data.get("linkKey");
+        if (!(field instanceof LinkedField<?, ?> linkedField)) return;
+        Object linkKey = deserializeLinkKey(linkedField, msg.data.get("linkKey"));
+        if (linkKey == null) return;
         Object oldValue = deserializeValue(field.codec(), msg.data.get("oldValue"));
         Object newValue = deserializeValue(field.codec(), msg.data.get("newValue"));
         Set<UUID> affected = listToUuidSet(msg.data.get("affected"));
         RemoteChangeHandler handler = remoteChangeHandler;
-        if (handler != null && field instanceof LinkedField<?, ?> linkedField) {
-            handler.onLinkedChange(field, linkedField.linkType().name(), linkKey, newValue);
+        if (handler != null) {
+            handler.onLinkedChange(field, linkedField.linkType().name(), linkKey.toString(), newValue);
         }
         super.fireLinkedDataChanged(field, linkKey, oldValue, newValue, affected);
     }
@@ -225,13 +226,36 @@ public class DistributedEventBus extends EventBus {
         DataField<?> raw = fieldRegistry.get(msg.fieldKey);
         if (!(raw instanceof ExpiringLinkedField)) return;
         ExpiringLinkedField<Object, Object> field = (ExpiringLinkedField<Object, Object>) raw;
-        String linkKey = (String) msg.data.get("linkKey");
+        Object linkKey = deserializeLinkKey(field, msg.data.get("linkKey"));
+        if (linkKey == null) return;
         Object expiredValue = deserializeValue(field.codec(), msg.data.get("expiredValue"));
         Set<UUID> memberIds = listToUuidSet(msg.data.get("memberIds"));
         super.fireLinkedExpired(field, linkKey, expiredValue, memberIds);
     }
 
     // ==================== Serialization ====================
+
+    /**
+     * Encodes a link key with its {@link LinkType}'s key codec so the receiving node can rebuild the
+     * typed key rather than handing listeners a bare string. The cache-coherency path still keys
+     * containers by {@code toString()}, which round-trips through the codec unchanged.
+     */
+    private String serializeLinkKey(DataField<?> field, Object linkKey) {
+        Codec<Object> keyCodec = linkKeyCodec(field);
+        if (keyCodec == null || linkKey == null) return null;
+        return serializeValue(keyCodec, linkKey);
+    }
+
+    private Object deserializeLinkKey(DataField<?> field, Object serialized) {
+        Codec<Object> keyCodec = linkKeyCodec(field);
+        if (keyCodec == null) return null;
+        return deserializeValue(keyCodec, serialized);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Codec<Object> linkKeyCodec(DataField<?> field) {
+        return field instanceof LinkedField<?, ?> linked ? (Codec<Object>) linked.linkType().keyCodec() : null;
+    }
 
     private <T> String serializeValue(Codec<T> codec, T value) {
         if (value == null) return null;
