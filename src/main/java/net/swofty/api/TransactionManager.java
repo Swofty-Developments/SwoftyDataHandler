@@ -1,16 +1,18 @@
 package net.swofty.api;
 
+import net.swofty.DataField;
 import net.swofty.LinkedField;
 import net.swofty.PlayerField;
 import net.swofty.LinkType;
+import net.swofty.event.EventBus;
 import net.swofty.lock.DistributedLock;
 import net.swofty.transaction.*;
 
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.UnaryOperator;
 
 class TransactionManager {
@@ -19,21 +21,23 @@ class TransactionManager {
     private final PlayerDataManager playerData;
     private final LinkedDataManager linkedData;
     private final LinkRegistryImpl linkRegistry;
+    private final EventBus eventBus;
     private final DistributedLock distributedLock;
     private final Duration lockTimeout;
 
-    public TransactionManager(PlayerDataManager playerData, LinkedDataManager linkedData, LinkRegistryImpl linkRegistry) {
-        this(playerData, linkedData, linkRegistry, null, Duration.ofSeconds(10));
-    }
-
     public TransactionManager(PlayerDataManager playerData, LinkedDataManager linkedData, LinkRegistryImpl linkRegistry,
-                              DistributedLock distributedLock, Duration lockTimeout) {
+                              EventBus eventBus, DistributedLock distributedLock, Duration lockTimeout) {
         this.playerData = playerData;
         this.linkedData = linkedData;
         this.linkRegistry = linkRegistry;
+        this.eventBus = eventBus;
         this.distributedLock = distributedLock;
         this.lockTimeout = lockTimeout;
     }
+
+    // A pending write, kept with the field it came from so commit can persist it and then fire
+    // the same events a direct set() would.
+    private record Write(DataField<?> field, Object value) {}
 
     // Cross-node mutual exclusion when a distributed lock is configured; a no-op handle
     // otherwise, leaving the JVM-local monitor as the only guard (single-node behaviour).
@@ -104,9 +108,9 @@ class TransactionManager {
         private final LinkType<?> boundType;
         private final Object boundKey;
         private final Map<String, Object> originalPlayerValues = new HashMap<>();
-        private final Map<String, Object> newPlayerValues = new HashMap<>();
+        private final Map<String, Write> newPlayerValues = new HashMap<>();
         private final Map<String, Object> originalLinkedValues = new HashMap<>();
-        private final Map<String, Object> newLinkedValues = new HashMap<>();
+        private final Map<String, Write> newLinkedValues = new HashMap<>();
         private boolean committed = false;
         private boolean rolledBack = false;
 
@@ -120,8 +124,9 @@ class TransactionManager {
         @SuppressWarnings("unchecked")
         public <T> T get(PlayerField<T> field) {
             requirePlayer();
-            if (newPlayerValues.containsKey(field.fullKey())) {
-                return (T) newPlayerValues.get(field.fullKey());
+            Write pending = newPlayerValues.get(field.fullKey());
+            if (pending != null) {
+                return (T) pending.value();
             }
             T value = playerData.getFieldValue(player, field);
             originalPlayerValues.putIfAbsent(field.fullKey(), value);
@@ -135,7 +140,7 @@ class TransactionManager {
             if (!originalPlayerValues.containsKey(field.fullKey())) {
                 originalPlayerValues.put(field.fullKey(), playerData.getFieldValue(player, field));
             }
-            newPlayerValues.put(field.fullKey(), value);
+            newPlayerValues.put(field.fullKey(), new Write(field, value));
         }
 
         @Override
@@ -148,8 +153,9 @@ class TransactionManager {
         @SuppressWarnings("unchecked")
         public <K, T> T get(LinkedField<K, T> field) {
             String linkedKey = linkedKey(field);
-            if (newLinkedValues.containsKey(linkedKey)) {
-                return (T) newLinkedValues.get(linkedKey);
+            Write pending = newLinkedValues.get(linkedKey);
+            if (pending != null) {
+                return (T) pending.value();
             }
             K linkKey = resolveLink(field.linkType());
             if (linkKey == null) return field.defaultValue();
@@ -169,7 +175,7 @@ class TransactionManager {
             if (!originalLinkedValues.containsKey(linkedKey)) {
                 originalLinkedValues.put(linkedKey, linkedData.getFieldValue(field.linkType().name(), linkKey, field));
             }
-            newLinkedValues.put(linkedKey, value);
+            newLinkedValues.put(linkedKey, new Write(field, value));
         }
 
         @Override
@@ -217,6 +223,7 @@ class TransactionManager {
             return "Player " + player + " is not linked to " + type.name();
         }
 
+        @SuppressWarnings("unchecked")
         void commit() {
             if (committed || rolledBack) return;
             committed = true;
@@ -224,24 +231,42 @@ class TransactionManager {
             // Apply player field changes
             if (!newPlayerValues.isEmpty()) {
                 DataContainer playerContainer = playerData.getContainer(player);
-                for (Map.Entry<String, Object> entry : newPlayerValues.entrySet()) {
-                    playerContainer.rawData().put(entry.getKey(), entry.getValue());
+                for (Write write : newPlayerValues.values()) {
+                    playerContainer.set((DataField<Object>) write.field(), write.value());
                 }
                 playerData.persist(player);
             }
 
             // Apply linked field changes
-            for (Map.Entry<String, Object> entry : newLinkedValues.entrySet()) {
-                String lk = entry.getKey();
-                int colonIdx = lk.indexOf(':');
-                String linkTypeName = lk.substring(0, colonIdx);
-                String fieldFullKey = lk.substring(colonIdx + 1);
-
-                Object linkKey = resolveLink(linkTypeName);
+            for (Write write : newLinkedValues.values()) {
+                LinkedField<Object, Object> field = (LinkedField<Object, Object>) write.field();
+                Object linkKey = resolveLink(field.linkType());
                 if (linkKey != null) {
-                    linkedData.setFieldValue(linkTypeName, linkKey,
-                            new SimpleFieldRef(fieldFullKey), entry.getValue());
+                    linkedData.setFieldValue(field.linkType().name(), linkKey, field, write.value());
                 }
+            }
+
+            fireEvents();
+        }
+
+        // A transactional write is still a write: without this, committed changes reached storage
+        // but no listener ran locally, nothing was published, and peers kept serving stale caches.
+        @SuppressWarnings("unchecked")
+        private void fireEvents() {
+            for (Map.Entry<String, Write> entry : newPlayerValues.entrySet()) {
+                Write write = entry.getValue();
+                eventBus.firePlayerDataChanged((DataField<Object>) write.field(), player,
+                        originalPlayerValues.get(entry.getKey()), write.value());
+            }
+
+            for (Map.Entry<String, Write> entry : newLinkedValues.entrySet()) {
+                Write write = entry.getValue();
+                LinkedField<Object, Object> field = (LinkedField<Object, Object>) write.field();
+                Object linkKey = resolveLink(field.linkType());
+                if (linkKey == null) continue;
+                Set<UUID> affected = linkRegistry.getLinkedPlayers((LinkType<Object>) field.linkType(), linkKey);
+                eventBus.fireLinkedDataChanged(field, linkKey,
+                        originalLinkedValues.get(entry.getKey()), write.value(), affected);
             }
         }
 

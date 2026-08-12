@@ -52,7 +52,7 @@ public class DataAPIImpl implements DataAPI {
         this.playerData = new PlayerDataManager(storage, format, eventBus, autoPersist);
         this.linkedData = new LinkedDataManager(storage, format, eventBus, linkRegistry, autoPersist);
         this.expirationManager = new ExpirationManager();
-        this.transactionManager = new TransactionManager(playerData, linkedData, linkRegistry,
+        this.transactionManager = new TransactionManager(playerData, linkedData, linkRegistry, eventBus,
                 distributedLock, Duration.ofSeconds(10));
         this.bulkOperations = new BulkOperationExecutor(playerData, linkedData, storage, eventBus);
 
