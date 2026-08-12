@@ -1,6 +1,7 @@
 package net.swofty;
 
 import net.swofty.event.*;
+import net.swofty.lock.DistributedLock;
 import net.swofty.transaction.TransactionConsumer;
 import net.swofty.transaction.TransactionFunction;
 
@@ -96,4 +97,12 @@ public interface DataAPI {
     <K> void flushLink(LinkType<K> type, K key);
     <K> void unloadLink(LinkType<K> type, K key);
     <K> boolean isLinkLoaded(LinkType<K> type, K key);
+
+    // Distributed locking - takes the configured DistributedLock for an app-level critical section
+    // that spans more than one field or entity. Use with try-with-resources; requires a lock to
+    // have been supplied to the implementation.
+    DistributedLock.Handle lock(String key, Duration timeout);
+
+    // Flushes deferred writes, stops expiration timers and closes pub/sub subscribers.
+    void shutdown();
 }

@@ -387,6 +387,7 @@ public class DataAPIImpl implements DataAPI {
      * sections that span more than one field or entity (e.g. transferring coins between two coops).
      * Use with try-with-resources. Requires a distributed lock to have been supplied.
      */
+    @Override
     public DistributedLock.Handle lock(String key, Duration timeout) {
         if (distributedLock == null) {
             throw new IllegalStateException("No DistributedLock configured on this DataAPI");
@@ -394,6 +395,7 @@ public class DataAPIImpl implements DataAPI {
         return distributedLock.acquire(key, timeout);
     }
 
+    @Override
     public void shutdown() {
         // Flush any deferred writes so nothing is lost on a clean shutdown.
         playerData.flushAll();
