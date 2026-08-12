@@ -8,15 +8,12 @@ import net.swofty.data.DataFormat;
 import net.swofty.event.EventBus;
 import net.swofty.storage.DataStorage;
 import net.swofty.storage.LeaderboardIndex;
-import net.swofty.storage.SaveRequest;
 import net.swofty.storage.SaveResult;
-import net.swofty.storage.StorageKey;
 import net.swofty.storage.VersionedData;
 
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.function.ToDoubleFunction;
 import java.util.function.UnaryOperator;
@@ -24,12 +21,16 @@ import java.util.function.UnaryOperator;
 // Internal to net.swofty.api — reach it through DataAPI / DataAPIImpl, not directly.
 class PlayerDataManager {
     private static final System.Logger LOGGER = System.getLogger(PlayerDataManager.class.getName());
+    private static final String TYPE = "players";
 
     private final DataStorage storage;
     private final DataFormat format;
     private final EventBus eventBus;
     private final ConcurrentHashMap<UUID, DataContainer> cache = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<UUID, EntitySession> sessions = new ConcurrentHashMap<>();
+    private final EntityLocks locks = new EntityLocks();
+    // Only holds players with a load in flight right now, so it drains itself instead of growing
+    // one entry per player the node has ever seen.
+    private final ConcurrentHashMap<UUID, CompletableFuture<Void>> loads = new ConcurrentHashMap<>();
     // Optional custom score functions, keyed by field. Numeric fields need no entry here — they
     // are scored automatically — so leaderboards require no registration in the common case.
     private final ConcurrentHashMap<String, ToDoubleFunction<?>> scorers = new ConcurrentHashMap<>();
@@ -47,10 +48,8 @@ class PlayerDataManager {
     }
 
     public Object getLock(UUID player) {
-        return session(player);
+        return locks.forKey(player);
     }
-
-    private EntitySession session(UUID player) { return sessions.computeIfAbsent(player, ignored -> new EntitySession()); }
 
     DataContainer getContainer(UUID player) {
         return cache.computeIfAbsent(player, id -> new DataContainer());
@@ -70,7 +69,7 @@ class PlayerDataManager {
         synchronized (getLock(player)) {
             T oldValue = getFieldValue(player, field);
             SaveResult saved = setFieldValue(player, field, value);
-            eventBus.firePlayerDataChanged(field, player, oldValue, value, saved.saved() ? saved.version() : -1L);
+            eventBus.firePlayerDataChanged(field, player, oldValue, value, eventVersion(saved));
             return saved;
         }
     }
@@ -81,12 +80,17 @@ class PlayerDataManager {
             T newValue = updater.apply(oldValue);
             Validation.validate(field, newValue);
             SaveResult saved = setFieldValue(player, field, newValue);
-            eventBus.firePlayerDataChanged(field, player, oldValue, newValue, saved.saved() ? saved.version() : -1L);
+            eventBus.firePlayerDataChanged(field, player, oldValue, newValue, eventVersion(saved));
             return saved;
         }
     }
 
-    @SuppressWarnings("unchecked")
+    // A deferred write has no durable version to order peers by, so it publishes unversioned and is
+    // delivered unconditionally; only a write that actually reached storage can claim a sequence.
+    static long eventVersion(SaveResult result) {
+        return result.saved() ? result.version() : 0L;
+    }
+
     <T> T getFieldValue(UUID player, DataField<T> field) {
         DataContainer container = getContainer(player);
         if (!container.has(field.fullKey())) {
@@ -105,26 +109,24 @@ class PlayerDataManager {
         if (autoPersist) {
             return persist(player);
         }
-        return SaveResult.unchanged("players", player.toString(), container.documentVersion());
+        return SaveResult.unchanged(TYPE, player.toString(), container.documentVersion());
     }
 
     private void ensureDocumentLoaded(UUID player, DataContainer container) {
         if (!container.isDocumentLoaded()) {
-            VersionedData loaded = storage.loadVersioned("players", player.toString());
+            VersionedData loaded = storage.loadVersioned(TYPE, player.toString());
             container.loadDocument(format, loaded.data(), loaded.version());
         }
     }
 
     SaveResult persist(UUID player) {
         DataContainer container = cache.get(player);
-        if (container != null) {
-            byte[] bytes = container.serialize(format);
-            SaveResult result = storage.save("players", player.toString(), bytes).toCompletableFuture().join();
-            container.markPersisted(bytes, result.version());
-            updateLeaderboards(player, container);
-            return result;
+        if (container == null) {
+            return SaveResult.unchanged(TYPE, player.toString(), 0L);
         }
-        return SaveResult.unchanged("players", player.toString(), 0);
+        SaveResult result = DocumentWriter.write(storage, format, TYPE, player.toString(), container);
+        updateLeaderboards(player, container);
+        return result;
     }
 
     // ---- Leaderboard indexing ----------------------------------------------
@@ -186,7 +188,7 @@ class PlayerDataManager {
     /** Rebuilds a field's index from stored data. Called automatically on first rank; also public. */
     public <T> void rebuildLeaderboard(PlayerField<T> field) {
         LeaderboardIndex index = requireLeaderboardIndex();
-        for (String id : storage.listIds("players")) {
+        for (String id : storage.listIds(TYPE)) {
             UUID player = UUID.fromString(id);
             T value = getFieldValue(player, field);
             Double score = scoreOf(field.fullKey(), value);
@@ -205,38 +207,56 @@ class PlayerDataManager {
         synchronized (getLock(player)) {
             DataContainer container = getContainer(player);
             if (!container.isDocumentLoaded()) {
-                VersionedData loaded = storage.loadVersioned("players", player.toString());
+                VersionedData loaded = storage.loadVersioned(TYPE, player.toString());
                 container.loadDocument(format, loaded.data(), loaded.version());
             }
         }
     }
 
-    public CompletionStage<Void> loadAsync(UUID player, Executor executor) {
-        EntitySession session = session(player);
-        synchronized (session) {
-            if (cache.get(player) != null && cache.get(player).isDocumentLoaded()) {
-                return CompletableFuture.completedFuture(null);
-            }
-            if (session.loading != null) return session.loading;
-            CompletableFuture<Void> future = new CompletableFuture<>();
-            session.loading = future;
-            try {
-                executor.execute(() -> {
-                    try { load(player); future.complete(null); }
-                    catch (Throwable failure) { future.completeExceptionally(failure); }
-                    finally { synchronized (session) { if (session.loading == future) session.loading = null; } }
-                });
-            } catch (Throwable failure) {
-                session.loading = null;
-                future.completeExceptionally(failure);
-            }
-            return future;
+    /**
+     * Loads off the calling thread. Concurrent calls for one player share the single in-flight
+     * load instead of queueing a second read of the same document behind the first.
+     */
+    public CompletableFuture<Void> loadAsync(UUID player, Executor executor) {
+        DataContainer cached = cache.get(player);
+        if (cached != null && cached.isDocumentLoaded()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        // Claimed without the entity monitor on purpose: the running load holds that monitor for as
+        // long as the storage read takes, and a caller asking to join it must not have to wait for
+        // the very read it is trying to share.
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        CompletableFuture<Void> inFlight = loads.putIfAbsent(player, future);
+        if (inFlight != null) return inFlight;
+        try {
+            executor.execute(() -> {
+                try {
+                    load(player);
+                    finishLoad(player, future, null);
+                } catch (Throwable failure) {
+                    finishLoad(player, future, failure);
+                }
+            });
+        } catch (Throwable rejected) {
+            finishLoad(player, future, rejected);
+        }
+        return future;
+    }
+
+    private void finishLoad(UUID player, CompletableFuture<Void> future, Throwable failure) {
+        loads.remove(player, future);
+        if (failure == null) {
+            future.complete(null);
+        } else {
+            future.completeExceptionally(failure);
         }
     }
 
+    // Flushing or unloading a player whose load is still in flight would race the load into an
+    // already evicted container, so the lifecycle operations queue behind it.
     private void awaitLoad(UUID player) {
-        CompletableFuture<Void> loading = session(player).loading;
-        if (loading != null) loading.join();
+        CompletableFuture<Void> inFlight = loads.get(player);
+        if (inFlight != null) inFlight.join();
     }
 
     /** Persists pending changes for a player if the cache holds unsaved edits. */
@@ -249,15 +269,13 @@ class PlayerDataManager {
                 eventBus.firePlayerSnapshotSaved(player, saved.version());
                 return saved;
             }
-            DataContainer current = cache.get(player);
-            return SaveResult.unchanged("players", player.toString(), current == null ? 0 : current.documentVersion());
+            return SaveResult.unchanged(TYPE, player.toString(),
+                    container == null ? 0L : container.documentVersion());
         }
     }
 
-    public CompletionStage<SaveResult> flushAsync(UUID player, Executor executor) {
-        CompletableFuture<Void> loading = session(player).loading;
-        CompletionStage<Void> before = loading == null ? CompletableFuture.completedFuture(null) : loading;
-        return before.thenApplyAsync(ignored -> flush(player), executor);
+    public CompletableFuture<Void> flushAsync(UUID player, Executor executor) {
+        return afterLoad(player, executor, () -> flush(player));
     }
 
     /** Flushes pending changes then evicts the player from this node's cache. */
@@ -270,17 +288,25 @@ class PlayerDataManager {
                 result = persist(player);
                 eventBus.firePlayerSnapshotSaved(player, result.version());
             } else {
-                result = SaveResult.unchanged("players", player.toString(), container == null ? 0 : container.documentVersion());
+                result = SaveResult.unchanged(TYPE, player.toString(),
+                        container == null ? 0L : container.documentVersion());
             }
             cache.remove(player);
         }
+        // Nothing here caches this player any more, so the ordering state kept for them is dead
+        // weight on every node that keeps running.
+        eventBus.forgetPlayer(player);
         return result;
     }
 
-    public CompletionStage<SaveResult> unloadAsync(UUID player, Executor executor) {
-        CompletableFuture<Void> loading = session(player).loading;
-        CompletionStage<Void> before = loading == null ? CompletableFuture.completedFuture(null) : loading;
-        return before.thenApplyAsync(ignored -> unload(player), executor);
+    public CompletableFuture<Void> unloadAsync(UUID player, Executor executor) {
+        return afterLoad(player, executor, () -> unload(player));
+    }
+
+    private CompletableFuture<Void> afterLoad(UUID player, Executor executor, Runnable action) {
+        CompletableFuture<Void> inFlight = loads.get(player);
+        CompletableFuture<Void> before = inFlight == null ? CompletableFuture.completedFuture(null) : inFlight;
+        return before.thenRunAsync(action, executor);
     }
 
     public boolean isLoaded(UUID player) {
@@ -304,7 +330,7 @@ class PlayerDataManager {
             if (container.isDirty()) {
                 persist(player);
             }
-            VersionedData loaded = storage.loadVersioned("players", player.toString());
+            VersionedData loaded = storage.loadVersioned(TYPE, player.toString());
             container.reload(loaded.data(), loaded.version());
         }
     }
@@ -321,41 +347,36 @@ class PlayerDataManager {
      * without re-persisting or re-firing events. Only touches players that are currently
      * loaded here, so it never resurrects an evicted or never-loaded entity.
      */
-    <T> boolean applyRemote(DataField<T> field, UUID player, T newValue, long version) {
-        DataContainer container = cache.get(player);
-        if (container == null) return true;
-        synchronized (getLock(player)) {
-            container = cache.get(player);
-            if (container == null) return true;
-            return container.applyRemote(field, newValue, version, format);
-        }
-    }
-
-    List<SaveRequest> snapshotDocuments() {
-        List<SaveRequest> requests = new ArrayList<>();
-        for (UUID player : cache.keySet()) {
-            synchronized (getLock(player)) {
-                DataContainer container = cache.get(player);
-                if (container != null) requests.add(new SaveRequest(new StorageKey("players", player.toString()),
-                        container.serialize(format)));
-            }
-        }
-        return requests;
-    }
-
-    long currentVersion(UUID player) {
-        DataContainer container = cache.get(player);
-        return container == null ? 0L : container.documentVersion();
-    }
-
-    void applyRemoteSnapshot(UUID player, long version) {
+    <T> void applyRemote(DataField<T> field, UUID player, T newValue) {
         DataContainer container = cache.get(player);
         if (container == null) return;
         synchronized (getLock(player)) {
             container = cache.get(player);
-            if (container == null || container.isDirty() || version <= container.documentVersion()) return;
-            VersionedData loaded = storage.loadVersioned("players", player.toString());
-            if (loaded.version() >= version) container.reload(loaded.data(), loaded.version());
+            if (container == null) return;
+            container.applyRemote(field, newValue, format);
+        }
+    }
+
+    /**
+     * Rereads a player another node has just flushed, so a deferred write that was never published
+     * field by field still converges here. Returns whether the cached document actually moved.
+     */
+    boolean applyRemoteSnapshot(UUID player, long version) {
+        DataContainer container = cache.get(player);
+        if (container == null) return false;
+        synchronized (getLock(player)) {
+            container = cache.get(player);
+            if (container == null || version <= container.documentVersion()) return false;
+            if (container.isDirty()) {
+                LOGGER.log(System.Logger.Level.DEBUG,
+                        "Not applying remote snapshot " + version + " for player " + player
+                                + ": this node holds unsaved changes that would be discarded");
+                return false;
+            }
+            VersionedData loaded = storage.loadVersioned(TYPE, player.toString());
+            if (loaded.version() < version) return false;
+            container.reload(loaded.data(), loaded.version());
+            return true;
         }
     }
 
@@ -381,6 +402,14 @@ class PlayerDataManager {
     }
 
     public List<String> listPlayerIds() {
-        return storage.listIds("players");
+        return storage.listIds(TYPE);
+    }
+
+    int loadsInFlight() {
+        return loads.size();
+    }
+
+    int cachedCount() {
+        return cache.size();
     }
 }

@@ -6,25 +6,22 @@ import net.swofty.LinkedField;
 import net.swofty.data.DataFormat;
 import net.swofty.event.EventBus;
 import net.swofty.storage.DataStorage;
-import net.swofty.storage.SaveRequest;
 import net.swofty.storage.SaveResult;
-import net.swofty.storage.StorageKey;
 import net.swofty.storage.VersionedData;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionStage;
-import java.util.concurrent.Executor;
 import java.util.function.UnaryOperator;
 
 class LinkedDataManager {
+    private static final System.Logger LOGGER = System.getLogger(LinkedDataManager.class.getName());
+
     private final DataStorage storage;
     private final DataFormat format;
     private final EventBus eventBus;
     private final LinkRegistryImpl linkRegistry;
     private final ConcurrentHashMap<String, DataContainer> cache = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, EntitySession> sessions = new ConcurrentHashMap<>();
+    private final EntityLocks locks = new EntityLocks();
     private final boolean autoPersist;
 
     public LinkedDataManager(DataStorage storage, DataFormat format, EventBus eventBus, LinkRegistryImpl linkRegistry) {
@@ -41,11 +38,15 @@ class LinkedDataManager {
     }
 
     Object getLock(String compositeKey) {
-        return sessions.computeIfAbsent(compositeKey, ignored -> new EntitySession());
+        return locks.forKey(compositeKey);
     }
 
     static String compositeKey(String linkTypeName, Object key) {
         return linkTypeName + ":" + key;
+    }
+
+    static String storageType(String linkTypeName) {
+        return "linked/" + linkTypeName;
     }
 
     DataContainer getContainer(String compositeKey) {
@@ -92,7 +93,8 @@ class LinkedDataManager {
             T oldValue = getFieldValue(field.linkType().name(), key, field);
             SaveResult saved = setFieldValue(field.linkType().name(), key, field, value);
             Set<UUID> affected = linkRegistry.getLinkedPlayers(field.linkType(), key);
-            eventBus.fireLinkedDataChanged(field, key, oldValue, value, affected, saved.saved() ? saved.version() : -1L);
+            eventBus.fireLinkedDataChanged(field, key, oldValue, value, affected,
+                    PlayerDataManager.eventVersion(saved));
             return saved;
         }
     }
@@ -113,12 +115,12 @@ class LinkedDataManager {
             Validation.validate(field, newValue);
             SaveResult saved = setFieldValue(field.linkType().name(), key, field, newValue);
             Set<UUID> affected = linkRegistry.getLinkedPlayers(field.linkType(), key);
-            eventBus.fireLinkedDataChanged(field, key, oldValue, newValue, affected, saved.saved() ? saved.version() : -1L);
+            eventBus.fireLinkedDataChanged(field, key, oldValue, newValue, affected,
+                    PlayerDataManager.eventVersion(saved));
             return saved;
         }
     }
 
-    @SuppressWarnings("unchecked")
     <T> T getFieldValue(String linkTypeName, Object key, DataField<T> field) {
         String ck = compositeKey(linkTypeName, key);
         DataContainer container = getContainer(ck);
@@ -137,25 +139,18 @@ class LinkedDataManager {
         if (autoPersist) {
             return persistLinked(linkTypeName, key, container);
         }
-        return SaveResult.unchanged("linked/" + linkTypeName, key.toString(), container.documentVersion());
+        return SaveResult.unchanged(storageType(linkTypeName), key.toString(), container.documentVersion());
     }
 
     private void ensureDocumentLoaded(String linkTypeName, Object key, DataContainer container) {
         if (!container.isDocumentLoaded()) {
-            VersionedData loaded = storage.loadVersioned("linked/" + linkTypeName, key.toString());
+            VersionedData loaded = storage.loadVersioned(storageType(linkTypeName), key.toString());
             container.loadDocument(format, loaded.data(), loaded.version());
         }
     }
 
-    private SaveResult persistLinked(String linkTypeName, String keyString, DataContainer container) {
-        byte[] bytes = container.serialize(format);
-        SaveResult result = storage.save("linked/" + linkTypeName, keyString, bytes).toCompletableFuture().join();
-        container.markPersisted(bytes, result.version());
-        return result;
-    }
-
     private SaveResult persistLinked(String linkTypeName, Object key, DataContainer container) {
-        return persistLinked(linkTypeName, key.toString(), container);
+        return DocumentWriter.write(storage, format, storageType(linkTypeName), key.toString(), container);
     }
 
     // ---- Lifecycle ----------------------------------------------------------
@@ -166,7 +161,7 @@ class LinkedDataManager {
         synchronized (getLock(ck)) {
             DataContainer container = getContainer(ck);
             if (!container.isDocumentLoaded()) {
-                VersionedData loaded = storage.loadVersioned("linked/" + linkTypeName, key.toString());
+                VersionedData loaded = storage.loadVersioned(storageType(linkTypeName), key.toString());
                 container.loadDocument(format, loaded.data(), loaded.version());
             }
         }
@@ -181,8 +176,8 @@ class LinkedDataManager {
                 eventBus.fireLinkedSnapshotSaved(linkTypeName, key, saved.version());
                 return saved;
             }
-            return SaveResult.unchanged("linked/" + linkTypeName, key.toString(),
-                    container == null ? 0 : container.documentVersion());
+            return SaveResult.unchanged(storageType(linkTypeName), key.toString(),
+                    container == null ? 0L : container.documentVersion());
         }
     }
 
@@ -195,12 +190,32 @@ class LinkedDataManager {
                 result = persistLinked(linkTypeName, key, container);
                 eventBus.fireLinkedSnapshotSaved(linkTypeName, key, result.version());
             } else {
-                result = SaveResult.unchanged("linked/" + linkTypeName, key.toString(),
-                        container == null ? 0 : container.documentVersion());
+                result = SaveResult.unchanged(storageType(linkTypeName), key.toString(),
+                        container == null ? 0L : container.documentVersion());
             }
             cache.remove(ck);
         }
+        eventBus.forgetLinked(linkTypeName, key);
         return result;
+    }
+
+    /** Drops the cached view without persisting it, for an entity whose document is gone. */
+    void evict(String linkTypeName, Object key) {
+        String ck = compositeKey(linkTypeName, key);
+        synchronized (getLock(ck)) {
+            cache.remove(ck);
+        }
+        eventBus.forgetLinked(linkTypeName, key);
+    }
+
+    /** Deletes the shared document itself and forgets everything cached about it here. */
+    void deleteLinked(String linkTypeName, Object key) {
+        String ck = compositeKey(linkTypeName, key);
+        synchronized (getLock(ck)) {
+            cache.remove(ck);
+            storage.delete(storageType(linkTypeName), key.toString());
+        }
+        eventBus.forgetLinked(linkTypeName, key);
     }
 
     public boolean isLinkedLoaded(String linkTypeName, Object key) {
@@ -221,7 +236,7 @@ class LinkedDataManager {
             if (container.isDirty()) {
                 persistLinked(linkTypeName, key, container);
             }
-            VersionedData loaded = storage.loadVersioned("linked/" + linkTypeName, key.toString());
+            VersionedData loaded = storage.loadVersioned(storageType(linkTypeName), key.toString());
             container.reload(loaded.data(), loaded.version());
         }
     }
@@ -231,15 +246,7 @@ class LinkedDataManager {
         for (String ck : cache.keySet()) {
             int colon = ck.indexOf(':');
             if (colon < 0) continue;
-            String linkTypeName = ck.substring(0, colon);
-            String keyString = ck.substring(colon + 1);
-            synchronized (getLock(ck)) {
-                DataContainer container = cache.get(ck);
-                if (container != null && container.isDirty()) {
-                    SaveResult saved = persistLinked(linkTypeName, keyString, container);
-                    eventBus.fireLinkedSnapshotSaved(linkTypeName, keyString, saved.version());
-                }
-            }
+            flushLinked(ck.substring(0, colon), ck.substring(colon + 1));
         }
     }
 
@@ -247,51 +254,43 @@ class LinkedDataManager {
      * Applies a change that originated on another node to a locally cached shared entity,
      * without re-persisting or re-firing events. Only touches entities currently loaded here.
      */
-    <T> boolean applyRemote(String linkTypeName, Object key, DataField<T> field, T newValue, long version) {
+    <T> void applyRemote(String linkTypeName, Object key, DataField<T> field, T newValue) {
         String ck = compositeKey(linkTypeName, key);
-        DataContainer container = cache.get(ck);
-        if (container == null) return true;
-        synchronized (getLock(ck)) {
-            container = cache.get(ck);
-            if (container == null) return true;
-            return container.applyRemote(field, newValue, version, format);
-        }
-    }
-
-    public List<String> listLinkedIds(String linkTypeName) {
-        return storage.listIds("linked/" + linkTypeName);
-    }
-
-    List<SaveRequest> snapshotDocuments() {
-        List<SaveRequest> requests = new ArrayList<>();
-        for (Map.Entry<String, DataContainer> entry : cache.entrySet()) {
-            String ck = entry.getKey();
-            int colon = ck.indexOf(':');
-            if (colon < 0) continue;
-            synchronized (getLock(ck)) {
-                DataContainer container = cache.get(ck);
-                if (container != null) requests.add(new SaveRequest(
-                        new StorageKey("linked/" + ck.substring(0, colon), ck.substring(colon + 1)),
-                        container.serialize(format)));
-            }
-        }
-        return requests;
-    }
-
-    long currentVersion(String linkTypeName, Object key) {
-        DataContainer container = cache.get(compositeKey(linkTypeName, key));
-        return container == null ? 0L : container.documentVersion();
-    }
-
-    void applyRemoteSnapshot(String linkTypeName, String linkKey, long version) {
-        String ck = compositeKey(linkTypeName, linkKey);
         DataContainer container = cache.get(ck);
         if (container == null) return;
         synchronized (getLock(ck)) {
             container = cache.get(ck);
-            if (container == null || container.isDirty() || version <= container.documentVersion()) return;
-            VersionedData loaded = storage.loadVersioned("linked/" + linkTypeName, linkKey);
-            if (loaded.version() >= version) container.reload(loaded.data(), loaded.version());
+            if (container == null) return;
+            container.applyRemote(field, newValue, format);
         }
+    }
+
+    public List<String> listLinkedIds(String linkTypeName) {
+        return storage.listIds(storageType(linkTypeName));
+    }
+
+    /** Rereads a shared entity another node has just flushed. Returns whether anything changed. */
+    boolean applyRemoteSnapshot(String linkTypeName, String linkKey, long version) {
+        String ck = compositeKey(linkTypeName, linkKey);
+        DataContainer container = cache.get(ck);
+        if (container == null) return false;
+        synchronized (getLock(ck)) {
+            container = cache.get(ck);
+            if (container == null || version <= container.documentVersion()) return false;
+            if (container.isDirty()) {
+                LOGGER.log(System.Logger.Level.DEBUG,
+                        "Not applying remote snapshot " + version + " for " + ck
+                                + ": this node holds unsaved changes that would be discarded");
+                return false;
+            }
+            VersionedData loaded = storage.loadVersioned(storageType(linkTypeName), linkKey);
+            if (loaded.version() < version) return false;
+            container.reload(loaded.data(), loaded.version());
+            return true;
+        }
+    }
+
+    int cachedCount() {
+        return cache.size();
     }
 }

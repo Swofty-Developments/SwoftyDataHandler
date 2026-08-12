@@ -72,6 +72,12 @@ class ExpirationManager {
         return expiration == null || Instant.now().isAfter(expiration.expiry());
     }
 
+    /** Forgets every expiration registered against a shared entity, e.g. when it is deleted. */
+    public void clearLinked(String linkTypeName, Object key) {
+        String prefix = "linked:" + linkTypeName + ":" + key + ":";
+        expirations.keySet().removeIf(registered -> registered.startsWith(prefix));
+    }
+
     public void shutdown() {
         scheduler.shutdown();
     }
