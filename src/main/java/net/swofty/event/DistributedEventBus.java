@@ -21,6 +21,13 @@ public class DistributedEventBus extends EventBus {
     private static final Gson GSON = new GsonBuilder().create();
     private static final Type MAP_TYPE = new TypeToken<Map<String, Object>>() {}.getType();
     private static final String SNAPSHOT_STREAM = "snapshot";
+    // Not a stream but a floor over all of them: the version of the whole document this node last
+    // read. Every event at or below it is already part of what was read.
+    private static final String DOCUMENT_FLOOR = "*document";
+    // How many entities one eviction pass may look at. Pinned entities cannot be evicted, and
+    // walking past a wall of them on every published and received event turned the ordering state
+    // into a per-event scan of the whole map.
+    private static final int EVICTION_SCAN_LIMIT = 64;
     private static final String PLAYER_PREFIX = "player:";
     private static final String LINKED_PREFIX = "linked:";
 
@@ -312,12 +319,24 @@ public class DistributedEventBus extends EventBus {
         if (version <= 0) return false;
         synchronized (sequences) {
             Map<String, Long> streams = sequences.computeIfAbsent(entity, ignored -> new HashMap<>());
+            Long floor = streams.get(DOCUMENT_FLOOR);
+            if (floor != null && version <= floor) return true;
             Long previous = streams.get(stream);
             if (previous != null && version <= previous) return true;
             streams.put(stream, version);
             evictUncachedEntities();
             return false;
         }
+    }
+
+    @Override
+    public void rememberPlayerDocument(UUID player, long version) {
+        remember(playerEntity(player), DOCUMENT_FLOOR, version);
+    }
+
+    @Override
+    public void rememberLinkedDocument(String linkTypeName, Object linkKey, long version) {
+        remember(linkedEntity(linkTypeName, linkKey), DOCUMENT_FLOOR, version);
     }
 
     private void remember(String entity, String stream, long version) {
@@ -331,12 +350,30 @@ public class DistributedEventBus extends EventBus {
     // Walks from the least recently touched entity, skipping the ones this node caches. Those are
     // pinned for as long as they are loaded, so the map can exceed the cap - by the number of
     // entities this node is actually serving, which is bounded by the node itself.
+    //
+    // The walk is capped, because a node serving more entities than the cap would otherwise step
+    // over every one of them on every single event, on the pub/sub receive path, holding this
+    // monitor. Whatever pinned entities it did step over are moved to the young end afterwards, so
+    // the next pass starts on candidates that might actually be evictable instead of the same wall.
     private void evictUncachedEntities() {
-        if (sequences.size() <= MAX_UNCACHED_TRACKED_ENTITIES) return;
+        int overflow = sequences.size() - MAX_UNCACHED_TRACKED_ENTITIES;
+        if (overflow <= 0) return;
+        List<String> steppedOver = null;
+        int examined = 0;
         Iterator<Map.Entry<String, Map<String, Long>>> entities = sequences.entrySet().iterator();
-        while (sequences.size() > MAX_UNCACHED_TRACKED_ENTITIES && entities.hasNext()) {
-            if (cachedHere(entities.next().getKey())) continue;
+        while (overflow > 0 && examined++ < EVICTION_SCAN_LIMIT && entities.hasNext()) {
+            String entity = entities.next().getKey();
+            if (cachedHere(entity)) {
+                if (steppedOver == null) steppedOver = new ArrayList<>();
+                steppedOver.add(entity);
+                continue;
+            }
             entities.remove();
+            overflow--;
+        }
+        if (steppedOver == null) return;
+        for (String entity : steppedOver) {
+            sequences.get(entity);
         }
     }
 

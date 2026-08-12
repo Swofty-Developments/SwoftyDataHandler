@@ -146,7 +146,14 @@ class LinkedDataManager {
         if (!container.isDocumentLoaded()) {
             VersionedData loaded = storage.loadVersioned(storageType(linkTypeName), key.toString());
             container.loadDocument(format, loaded.data(), loaded.version());
+            documentRead(linkTypeName, key, loaded.version());
         }
+    }
+
+    // Everything that produced the document just read is part of it, so any event at or below its
+    // version is already applied here.
+    private void documentRead(String linkTypeName, Object key, long version) {
+        eventBus.rememberLinkedDocument(linkTypeName, key, version);
     }
 
     private SaveResult persistLinked(String linkTypeName, Object key, DataContainer container) {
@@ -159,11 +166,7 @@ class LinkedDataManager {
     public void loadLinked(String linkTypeName, Object key) {
         String ck = compositeKey(linkTypeName, key);
         synchronized (getLock(ck)) {
-            DataContainer container = getContainer(ck);
-            if (!container.isDocumentLoaded()) {
-                VersionedData loaded = storage.loadVersioned(storageType(linkTypeName), key.toString());
-                container.loadDocument(format, loaded.data(), loaded.version());
-            }
+            ensureDocumentLoaded(linkTypeName, key, getContainer(ck));
         }
     }
 
@@ -238,6 +241,7 @@ class LinkedDataManager {
             }
             VersionedData loaded = storage.loadVersioned(storageType(linkTypeName), key.toString());
             container.reload(loaded.data(), loaded.version());
+            documentRead(linkTypeName, key, loaded.version());
         }
     }
 
@@ -286,6 +290,7 @@ class LinkedDataManager {
             VersionedData loaded = storage.loadVersioned(storageType(linkTypeName), linkKey);
             if (loaded.version() < version) return false;
             container.reload(loaded.data(), loaded.version());
+            documentRead(linkTypeName, linkKey, loaded.version());
             return true;
         }
     }

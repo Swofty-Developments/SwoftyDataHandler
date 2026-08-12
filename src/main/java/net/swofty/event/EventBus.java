@@ -131,6 +131,14 @@ public class EventBus {
     /** Signals that a shared entity's document was deleted outright. */
     public <K> void fireLinkDeleted(LinkType<K> type, K linkKey) {}
 
+    /**
+     * Records the version of a whole document this node has just read, so every event older than it
+     * is known to be already included and can be rejected on arrival.
+     */
+    public void rememberPlayerDocument(UUID player, long version) {}
+
+    public void rememberLinkedDocument(String linkTypeName, Object linkKey, long version) {}
+
     /** Drops the per-entity ordering state kept for a player this node no longer caches. */
     public void forgetPlayer(UUID player) {}
 

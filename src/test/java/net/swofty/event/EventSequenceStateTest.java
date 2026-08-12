@@ -1,10 +1,12 @@
 package net.swofty.event;
 
+import net.swofty.DataField;
 import net.swofty.PlayerField;
 import net.swofty.codec.Codecs;
 import org.junit.jupiter.api.Test;
 
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -48,6 +50,32 @@ class EventSequenceStateTest {
         }
         assertTrue(bus.trackedEntities() <= 4096,
                 "ordering state must be capped, tracked " + bus.trackedEntities() + " entities");
+    }
+
+    @Test
+    void evictionLooksAtABoundedNumberOfEntitiesEvenWhenEverythingIsPinned() {
+        AtomicInteger cacheQueries = new AtomicInteger();
+        DistributedEventBus bus = new DistributedEventBus(silent());
+        bus.setRemoteChangeHandler(new RemoteChangeHandler() {
+            @Override public <T> void onPlayerChange(DataField<T> field, UUID player, T newValue) {}
+            @Override public <T> void onLinkedChange(DataField<T> field, String type, String key, T newValue) {}
+            @Override public boolean isPlayerCached(UUID player) {
+                cacheQueries.incrementAndGet();
+                return true;
+            }
+        });
+
+        // Every entity is loaded here, so none of them can be evicted. A node that serves more
+        // entities than the cap must not pay a walk over all of them on every single event.
+        for (int i = 0; i < 6_000; i++) {
+            bus.firePlayerDataChanged(COINS, UUID.randomUUID(), 0, i, i + 1);
+        }
+        cacheQueries.set(0);
+
+        bus.firePlayerDataChanged(COINS, UUID.randomUUID(), 0, 1, 1L);
+
+        assertTrue(cacheQueries.get() <= 64,
+                "one event examined " + cacheQueries.get() + " entities looking for something to evict");
     }
 
     @Test

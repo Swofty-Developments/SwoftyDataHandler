@@ -227,6 +227,38 @@ class DistributedConvergenceTest {
     }
 
     @Test
+    void loadingAnEntityRejectsEventsOlderThanTheDocumentItJustRead() {
+        DataAPI writer = node(true);
+        DataAPI reader = node(true);
+        UUID player = UUID.randomUUID();
+        try {
+            reader.subscribe(COINS, (id, oldValue, newValue) -> {});
+
+            channel.record(true);
+            writer.set(player, COINS, 10);
+            String olderEvent = channel.lastPublished();
+            writer.set(player, COINS, 20);
+            channel.record(false);
+
+            // The reader is not serving this player, so its ordering state is fair game for the cap
+            // and unrelated traffic drops it. Loading the player afterwards has to re-establish the
+            // floor from the document itself, or a replayed event walks straight back in.
+            for (int i = 0; i < 6_000; i++) {
+                writer.set(UUID.randomUUID(), COINS, i);
+            }
+            reader.load(player);
+            assertEquals(20, reader.get(player, COINS));
+
+            channel.replay(olderEvent);
+            assertEquals(20, reader.get(player, COINS),
+                    "an event older than the document this node just read was applied");
+        } finally {
+            writer.shutdown();
+            reader.shutdown();
+        }
+    }
+
+    @Test
     void anOlderEventForOneFieldNeverOverwritesANewerOneForAnother() {
         DataAPI writer = node(true);
         DataAPI reader = node(true);

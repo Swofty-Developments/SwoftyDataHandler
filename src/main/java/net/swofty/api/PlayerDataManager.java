@@ -116,7 +116,15 @@ class PlayerDataManager {
         if (!container.isDocumentLoaded()) {
             VersionedData loaded = storage.loadVersioned(TYPE, player.toString());
             container.loadDocument(format, loaded.data(), loaded.version());
+            documentRead(player, loaded.version());
         }
+    }
+
+    // Everything that produced the document just read is part of it, so any event at or below its
+    // version is already applied here. Telling the bus that is what stops a replayed older event
+    // from being accepted after the entity's ordering state was dropped while it was uncached.
+    private void documentRead(UUID player, long version) {
+        eventBus.rememberPlayerDocument(player, version);
     }
 
     SaveResult persist(UUID player) {
@@ -205,11 +213,7 @@ class PlayerDataManager {
     /** Warms the player's whole document into this node's cache in a single storage read. */
     public void load(UUID player) {
         synchronized (getLock(player)) {
-            DataContainer container = getContainer(player);
-            if (!container.isDocumentLoaded()) {
-                VersionedData loaded = storage.loadVersioned(TYPE, player.toString());
-                container.loadDocument(format, loaded.data(), loaded.version());
-            }
+            ensureDocumentLoaded(player, getContainer(player));
         }
     }
 
@@ -332,6 +336,7 @@ class PlayerDataManager {
             }
             VersionedData loaded = storage.loadVersioned(TYPE, player.toString());
             container.reload(loaded.data(), loaded.version());
+            documentRead(player, loaded.version());
         }
     }
 
@@ -376,6 +381,7 @@ class PlayerDataManager {
             VersionedData loaded = storage.loadVersioned(TYPE, player.toString());
             if (loaded.version() < version) return false;
             container.reload(loaded.data(), loaded.version());
+            documentRead(player, loaded.version());
             return true;
         }
     }
