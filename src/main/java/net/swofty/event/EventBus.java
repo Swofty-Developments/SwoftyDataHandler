@@ -13,6 +13,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 public class EventBus {
+    private static final System.Logger LOGGER = System.getLogger(EventBus.class.getName());
+
     private final Map<String, List<PlayerDataListener<?>>> playerListeners = new ConcurrentHashMap<>();
     private final Map<String, List<LinkedDataListener<?, ?>>> linkedListeners = new ConcurrentHashMap<>();
     private final Map<String, List<LinkChangeListener<?>>> linkChangeListeners = new ConcurrentHashMap<>();
@@ -44,7 +46,8 @@ public class EventBus {
         List<PlayerDataListener<?>> listeners = playerListeners.get(field.fullKey());
         if (listeners != null) {
             for (PlayerDataListener<?> listener : listeners) {
-                ((PlayerDataListener<T>) listener).onChanged(player, oldValue, newValue);
+                dispatch(field.fullKey(), () ->
+                        ((PlayerDataListener<T>) listener).onChanged(player, oldValue, newValue));
             }
         }
     }
@@ -54,7 +57,8 @@ public class EventBus {
         List<LinkedDataListener<?, ?>> listeners = linkedListeners.get(field.fullKey());
         if (listeners != null) {
             for (LinkedDataListener<?, ?> listener : listeners) {
-                ((LinkedDataListener<K, T>) listener).onChanged(linkKey, oldValue, newValue, affected);
+                dispatch(field.fullKey(), () ->
+                        ((LinkedDataListener<K, T>) listener).onChanged(linkKey, oldValue, newValue, affected));
             }
         }
     }
@@ -64,7 +68,7 @@ public class EventBus {
         List<LinkChangeListener<?>> listeners = linkChangeListeners.get(type.name());
         if (listeners != null) {
             for (LinkChangeListener<?> listener : listeners) {
-                ((LinkChangeListener<K>) listener).onLinked(player, type, linkKey);
+                dispatch(type.name(), () -> ((LinkChangeListener<K>) listener).onLinked(player, type, linkKey));
             }
         }
     }
@@ -74,7 +78,7 @@ public class EventBus {
         List<LinkChangeListener<?>> listeners = linkChangeListeners.get(type.name());
         if (listeners != null) {
             for (LinkChangeListener<?> listener : listeners) {
-                ((LinkChangeListener<K>) listener).onUnlinked(player, type, previousKey);
+                dispatch(type.name(), () -> ((LinkChangeListener<K>) listener).onUnlinked(player, type, previousKey));
             }
         }
     }
@@ -84,7 +88,8 @@ public class EventBus {
         List<ExpirationListener<?>> listeners = expirationListeners.get(field.fullKey());
         if (listeners != null) {
             for (ExpirationListener<?> listener : listeners) {
-                ((ExpirationListener<T>) listener).onExpired(playerId, field, expiredValue);
+                dispatch(field.fullKey(), () ->
+                        ((ExpirationListener<T>) listener).onExpired(playerId, field, expiredValue));
             }
         }
     }
@@ -94,8 +99,22 @@ public class EventBus {
         List<LinkedExpirationListener<?, ?>> listeners = linkedExpirationListeners.get(field.fullKey());
         if (listeners != null) {
             for (LinkedExpirationListener<?, ?> listener : listeners) {
-                ((LinkedExpirationListener<K, T>) listener).onExpired(linkKey, field, expiredValue, memberIds);
+                dispatch(field.fullKey(), () ->
+                        ((LinkedExpirationListener<K, T>) listener).onExpired(linkKey, field, expiredValue, memberIds));
             }
+        }
+    }
+
+    /**
+     * Runs one listener in isolation. A listener that throws must not swallow the remaining
+     * listeners, and on the distributed path an escaping exception would tear down the pub/sub
+     * subscription and drop events for everyone.
+     */
+    private static void dispatch(String subject, Runnable invocation) {
+        try {
+            invocation.run();
+        } catch (Exception e) {
+            LOGGER.log(System.Logger.Level.ERROR, "Listener for " + subject + " threw", e);
         }
     }
 }
