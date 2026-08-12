@@ -118,11 +118,17 @@ no coordination, no lock and no pub/sub message required.
 | `InMemoryDataStorage` | per-key counter | compare and write under the key's monitor |
 | `FileDataStorage` | `<id><ext>.version` sidecar | compare and write under the instance monitor (one JVM only) |
 
-The retry loop has no give-up path, and deliberately so: a write that eventually gave up and
-overwrote the document would erase whatever a peer wrote in the meantime, which is the exact bug
-the comparison exists to prevent and is likeliest precisely when contention is high. It cannot spin
-indefinitely either, because every conflict means some other writer committed. Retries back off
-with jitter and log at `WARNING` if a document keeps losing.
+A write is never forced over the stored document. Giving up by overwriting would erase whatever a
+peer wrote in the meantime, which is the exact bug the comparison exists to prevent and is likeliest
+precisely when contention is high. Retries back off with jitter and log at `WARNING` if a document
+keeps losing.
+
+Contention alone resolves itself, because every conflict means another writer committed and the
+retry follows them. What does not resolve itself is a backend whose reads and writes disagree about
+what is stored — a failover to a lagging replica, where the reread keeps returning a version the
+write then rejects. Retrying is bounded by a generous time budget (a minute) for that case, after
+which the write throws `WriteConflictException` naming the document and the attempt count. The write
+did not happen, and nothing was overwritten to hide that.
 
 **What this does and does not give you.** Concurrent writes to *different* fields of one document
 both survive. Concurrent read-modify-write of the *same* field is still last-writer-wins: two nodes
@@ -613,6 +619,12 @@ for a *different* entity's lock while holding one throws `IllegalStateException`
 than waiting for a timeout, because two nodes doing that in opposite orders deadlock each other
 until both leases expire; take `api.lock(key, timeout)` explicitly, in a fixed order, if you need
 more than one entity.
+
+Both behaviours are tracked per `DistributedLock` **instance**. Several `DataAPIImpl`s sharing one
+lock instance (the usual arrangement, one lock per Redis) see each other's held keys, and a write on
+one of them still rereads its own document before writing even while riding a lock another took. Two
+separate lock objects pointed at the same Redis and prefix are one lock service but two instances,
+and are not tracked as one: share the instance.
 
 A lock alone does not prevent a lost update: it serialises writers, but a node could still take it
 and then compute its new value from a cached copy a peer had already overwritten. So with a
