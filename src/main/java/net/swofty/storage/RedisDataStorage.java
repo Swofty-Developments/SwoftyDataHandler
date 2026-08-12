@@ -8,8 +8,6 @@ import redis.clients.jedis.resps.Tuple;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionStage;
 
 public class RedisDataStorage implements DataStorage, LeaderboardIndex {
     private final JedisPool pool;
@@ -36,10 +34,29 @@ public class RedisDataStorage implements DataStorage, LeaderboardIndex {
         return prefix + ":index:" + type;
     }
 
-    private String versionKey(String type, String id) { return prefix + ":version:" + type + ":" + id; }
-    private static final byte[] SAVE_SCRIPT = ("local v=redis.call('incr',KEYS[2]);" +
-            "redis.call('set',KEYS[1],ARGV[1]);redis.call('sadd',KEYS[3],ARGV[2]);return v")
+    private byte[] indexKeyBytes(String type) {
+        return indexKey(type).getBytes(StandardCharsets.UTF_8);
+    }
+
+    private byte[] versionKey(String type, String id) {
+        return (prefix + ":version:" + type + ":" + id).getBytes(StandardCharsets.UTF_8);
+    }
+
+    // One round trip that bumps the version, replaces the document and keeps the id index in step,
+    // so no reader can ever see a document paired with the wrong version.
+    private static final byte[] SAVE_SCRIPT = ("local v=redis.call('incr',KEYS[2]);"
+            + "redis.call('set',KEYS[1],ARGV[1]);redis.call('sadd',KEYS[3],ARGV[2]);return v")
             .getBytes(StandardCharsets.UTF_8);
+
+    // The compare and the write happen inside the same script, which is what makes this a real
+    // compare-and-set rather than a check followed by a hopeful write.
+    private static final byte[] SAVE_IF_VERSION_SCRIPT = ("local stored=tonumber(redis.call('get',KEYS[2]) or '0');"
+            + "local expected=tonumber(ARGV[3]);"
+            + "if expected >= 0 and stored ~= expected then return {0,stored} end;"
+            + "local updated=redis.call('incr',KEYS[2]);"
+            + "redis.call('set',KEYS[1],ARGV[1]);redis.call('sadd',KEYS[3],ARGV[2]);return {1,updated}")
+            .getBytes(StandardCharsets.UTF_8);
+
     private static final byte[] LOAD_SCRIPT =
             "return {redis.call('get',KEYS[1]),redis.call('get',KEYS[2])}".getBytes(StandardCharsets.UTF_8);
 
@@ -51,26 +68,39 @@ public class RedisDataStorage implements DataStorage, LeaderboardIndex {
     }
 
     @Override
-    public CompletionStage<SaveResult> save(String type, String id, byte[] data) {
+    public void save(String type, String id, byte[] data) {
         try (Jedis jedis = pool.getResource()) {
-            Object raw = jedis.eval(SAVE_SCRIPT,
-                    List.of(dataKey(type, id), versionKey(type, id).getBytes(StandardCharsets.UTF_8),
-                            indexKey(type).getBytes(StandardCharsets.UTF_8)),
+            jedis.eval(SAVE_SCRIPT,
+                    List.of(dataKey(type, id), versionKey(type, id), indexKeyBytes(type)),
                     List.of(data, id.getBytes(StandardCharsets.UTF_8)));
-            long version = ((Number) raw).longValue();
-            return CompletableFuture.completedFuture(SaveResult.saved(type, id, version, data.length));
+        }
+    }
+
+    @Override
+    public SaveResult saveIfVersion(String type, String id, byte[] data, long expectedVersion) {
+        try (Jedis jedis = pool.getResource()) {
+            Object raw = jedis.eval(SAVE_IF_VERSION_SCRIPT,
+                    List.of(dataKey(type, id), versionKey(type, id), indexKeyBytes(type)),
+                    List.of(data, id.getBytes(StandardCharsets.UTF_8),
+                            Long.toString(expectedVersion).getBytes(StandardCharsets.UTF_8)));
+            @SuppressWarnings("unchecked") List<Long> reply = (List<Long>) raw;
+            long version = reply.get(1);
+            return reply.get(0) == 1L
+                    ? SaveResult.saved(type, id, version)
+                    : SaveResult.conflict(type, id, version);
         }
     }
 
     @Override
     public VersionedData loadVersioned(String type, String id) {
         try (Jedis jedis = pool.getResource()) {
-            Object raw = jedis.eval(LOAD_SCRIPT,
-                    List.of(dataKey(type, id), versionKey(type, id).getBytes(StandardCharsets.UTF_8)), List.of());
+            Object raw = jedis.eval(LOAD_SCRIPT, List.of(dataKey(type, id), versionKey(type, id)), List.of());
             @SuppressWarnings("unchecked") List<byte[]> values = (List<byte[]>) raw;
             byte[] data = values.get(0);
             byte[] version = values.get(1);
-            return new VersionedData(data, version == null ? 0L : Long.parseLong(new String(version, StandardCharsets.UTF_8)));
+            return new VersionedData(data, version == null
+                    ? VersionedData.UNVERSIONED
+                    : Long.parseLong(new String(version, StandardCharsets.UTF_8)));
         }
     }
 

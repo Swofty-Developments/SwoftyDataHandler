@@ -1,16 +1,27 @@
 package net.swofty.storage;
 
-/** Confirmed outcome of one durable write. */
-public record SaveResult(StorageKey key, long version, int bytesWritten, Status status) {
-    public enum Status { SAVED, UNCHANGED }
+/** Outcome of one durable write, including the version the document now carries. */
+public record SaveResult(StorageKey key, long version, Status status) {
+    public enum Status { SAVED, UNCHANGED, CONFLICT }
 
-    public static SaveResult saved(String type, String id, long version, int bytes) {
-        return new SaveResult(new StorageKey(type, id), version, bytes, Status.SAVED);
+    public static SaveResult saved(String type, String id, long version) {
+        return new SaveResult(new StorageKey(type, id), version, Status.SAVED);
     }
 
     public static SaveResult unchanged(String type, String id, long version) {
-        return new SaveResult(new StorageKey(type, id), version, 0, Status.UNCHANGED);
+        return new SaveResult(new StorageKey(type, id), version, Status.UNCHANGED);
     }
 
-    public boolean saved() { return status == Status.SAVED; }
+    /** The stored document had moved on; {@code version} is what the backend holds instead. */
+    public static SaveResult conflict(String type, String id, long currentVersion) {
+        return new SaveResult(new StorageKey(type, id), currentVersion, Status.CONFLICT);
+    }
+
+    public boolean saved() {
+        return status == Status.SAVED;
+    }
+
+    public boolean conflict() {
+        return status == Status.CONFLICT;
+    }
 }

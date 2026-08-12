@@ -26,6 +26,11 @@ class DataContainer {
     // output so a null-set actually deletes a field that still exists in the backing document.
     private final Set<String> tombstones = ConcurrentHashMap.newKeySet();
 
+    // Fields this node has actually written and not yet persisted. Everything else in {@link #data}
+    // was merely read, so it can be re-decoded from a fresher document instead of being replayed
+    // over one; that distinction is what makes {@link #rebase} safe.
+    private final Set<String> pendingWrites = ConcurrentHashMap.newKeySet();
+
     // The full serialized document as last seen in storage (null = no stored document).
     private volatile byte[] backingDocument;
     private volatile boolean documentLoaded;
@@ -39,6 +44,12 @@ class DataContainer {
     }
 
     public <T> void set(DataField<T> field, T value) {
+        store(field, value);
+        pendingWrites.add(field.fullKey());
+        dirty = true;
+    }
+
+    private <T> void store(DataField<T> field, T value) {
         if (value == null) {
             data.remove(field.fullKey());
             tombstones.add(field.fullKey());
@@ -46,7 +57,6 @@ class DataContainer {
             data.put(field.fullKey(), value);
             tombstones.remove(field.fullKey());
         }
-        dirty = true;
     }
 
     public boolean has(String fullKey) {
@@ -104,10 +114,28 @@ class DataContainer {
     public void reload(byte[] raw, long version) {
         data.clear();
         tombstones.clear();
+        pendingWrites.clear();
         this.backingDocument = raw;
         this.documentVersion = version;
         this.documentLoaded = true;
         this.dirty = false;
+    }
+
+    /**
+     * Rebases the pending writes onto a document that moved on underneath them, after a
+     * compare-and-set write lost the race.
+     *
+     * <p>Unlike {@link #reload(byte[], long)} the unsaved edits survive: only the values that were
+     * read (never written) are dropped, so the next {@link #serialize(DataFormat)} merges this
+     * node's own changes over whatever the winner actually stored instead of over the stale picture
+     * it started from.
+     */
+    public void rebase(byte[] raw, long version) {
+        data.keySet().removeIf(key -> !pendingWrites.contains(key));
+        tombstones.retainAll(pendingWrites);
+        this.backingDocument = raw;
+        this.documentVersion = version;
+        this.documentLoaded = true;
     }
 
     /** Merges the touched fields over the backing document so nothing untouched is lost. */
@@ -124,22 +152,17 @@ class DataContainer {
     }
 
     /**
-     * Applies a value that another node has already persisted. Updates the live view so
-     * local reads are fresh, but preserves the prior dirty state so a clean (e.g. read-only)
-     * container does not get marked dirty and re-persist stale sibling fields on unload.
+     * Applies a value that another node has already persisted. Updates the live view so local
+     * reads are fresh without marking the container dirty: the value is already in storage, and a
+     * clean (e.g. read-only) container must not start re-persisting stale sibling fields on unload.
      *
      * <p>The backing document is patched with the same value, so it stays an accurate picture
      * of what is in storage: a later local write merges over a base that already carries the
      * remote change instead of resurrecting the value this node last saw.
      */
-    public <T> boolean applyRemote(DataField<T> field, T value, long version, DataFormat format) {
-        if (version > 0 && version <= documentVersion) return false;
-        boolean wasDirty = this.dirty;
-        set(field, value);
-        this.dirty = wasDirty;
+    public <T> void applyRemote(DataField<T> field, T value, DataFormat format) {
+        store(field, value);
         patchBackingDocument(field.fullKey(), value, format);
-        documentVersion = Math.max(documentVersion, version);
-        return true;
     }
 
     // Stores the value exactly as serialize() would — the live object, written out by the
@@ -163,9 +186,18 @@ class DataContainer {
         this.documentVersion = Math.max(documentVersion, version);
         this.documentLoaded = true;
         this.dirty = false;
+        pendingWrites.clear();
     }
 
-    public long documentVersion() { return documentVersion; }
+    /**
+     * The version of the document this container last read or wrote in full. A remote field patch
+     * deliberately does not advance it: the patch proves one field moved, not that this node holds
+     * the winner's whole document, so the next write still has to compare-and-set against the
+     * version it really has.
+     */
+    public long documentVersion() {
+        return documentVersion;
+    }
 
     ConcurrentHashMap<String, Object> rawData() {
         return data;

@@ -2,8 +2,6 @@ package net.swofty.storage;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class InMemoryDataStorage implements DataStorage, LeaderboardIndex {
@@ -19,21 +17,42 @@ public class InMemoryDataStorage implements DataStorage, LeaderboardIndex {
 
     @Override
     public VersionedData loadVersioned(String type, String id) {
-        StorageKey key = new StorageKey(type, id);
-        AtomicLong version = versions.get(key);
-        if (version == null) return new VersionedData(load(type, id), 0L);
-        synchronized (version) { return new VersionedData(load(type, id), version.get()); }
+        AtomicLong version = versions.get(new StorageKey(type, id));
+        if (version == null) return new VersionedData(load(type, id), VersionedData.UNVERSIONED);
+        // The per-key monitor is what makes the data and the version one observation.
+        synchronized (version) {
+            return new VersionedData(load(type, id), version.get());
+        }
     }
 
     @Override
-    public CompletionStage<SaveResult> save(String type, String id, byte[] bytes) {
-        StorageKey key = new StorageKey(type, id);
-        long version;
-        synchronized (versions.computeIfAbsent(key, ignored -> new AtomicLong())) {
-            data.computeIfAbsent(type, k -> new ConcurrentHashMap<>()).put(id, Arrays.copyOf(bytes, bytes.length));
-            version = versions.get(key).incrementAndGet();
+    public void save(String type, String id, byte[] bytes) {
+        AtomicLong version = version(type, id);
+        synchronized (version) {
+            store(type, id, bytes);
+            version.incrementAndGet();
         }
-        return CompletableFuture.completedFuture(SaveResult.saved(type, id, version, bytes.length));
+    }
+
+    @Override
+    public SaveResult saveIfVersion(String type, String id, byte[] bytes, long expectedVersion) {
+        AtomicLong version = version(type, id);
+        synchronized (version) {
+            long current = version.get();
+            if (expectedVersion != VersionedData.ANY_VERSION && current != expectedVersion) {
+                return SaveResult.conflict(type, id, current);
+            }
+            store(type, id, bytes);
+            return SaveResult.saved(type, id, version.incrementAndGet());
+        }
+    }
+
+    private AtomicLong version(String type, String id) {
+        return versions.computeIfAbsent(new StorageKey(type, id), ignored -> new AtomicLong());
+    }
+
+    private void store(String type, String id, byte[] bytes) {
+        data.computeIfAbsent(type, k -> new ConcurrentHashMap<>()).put(id, Arrays.copyOf(bytes, bytes.length));
     }
 
     @Override

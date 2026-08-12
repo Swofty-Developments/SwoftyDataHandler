@@ -9,11 +9,12 @@ import org.bson.types.Binary;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionStage;
+import com.mongodb.MongoWriteException;
 import com.mongodb.client.model.FindOneAndUpdateOptions;
+import com.mongodb.client.model.Projections;
 import com.mongodb.client.model.ReturnDocument;
 import com.mongodb.client.model.Updates;
+import org.bson.conversions.Bson;
 
 public class MongoDataStorage implements DataStorage {
     private final MongoDatabase database;
@@ -42,21 +43,63 @@ public class MongoDataStorage implements DataStorage {
     }
 
     @Override
-    public CompletionStage<SaveResult> save(String type, String id, byte[] data) {
-        Document doc = collection(type).findOneAndUpdate(Filters.eq("_id", id),
-                Updates.combine(Updates.set("data", new Binary(data)), Updates.inc("version", 1L)),
-                new FindOneAndUpdateOptions().upsert(true).returnDocument(ReturnDocument.AFTER));
-        long version = doc == null ? 1L : ((Number) doc.getOrDefault("version", 1L)).longValue();
-        return CompletableFuture.completedFuture(SaveResult.saved(type, id, version, data.length));
+    public void save(String type, String id, byte[] data) {
+        collection(type).findOneAndUpdate(Filters.eq("_id", id), writeAndBump(data),
+                versionOnly().upsert(true));
+    }
+
+    @Override
+    public SaveResult saveIfVersion(String type, String id, byte[] data, long expectedVersion) {
+        if (expectedVersion == VersionedData.ANY_VERSION) {
+            Document overwritten = collection(type).findOneAndUpdate(Filters.eq("_id", id), writeAndBump(data),
+                    versionOnly().upsert(true));
+            return SaveResult.saved(type, id, overwritten == null ? 1L : versionOf(overwritten));
+        }
+        Bson filter = expectedVersion == VersionedData.UNVERSIONED
+                // A document that predates versioning, or one that does not exist yet, is version 0.
+                ? Filters.and(Filters.eq("_id", id),
+                        Filters.or(Filters.eq("version", 0L), Filters.exists("version", false)))
+                : Filters.and(Filters.eq("_id", id), Filters.eq("version", expectedVersion));
+        Document updated;
+        try {
+            updated = collection(type).findOneAndUpdate(filter, writeAndBump(data),
+                    versionOnly().upsert(expectedVersion == VersionedData.UNVERSIONED));
+        } catch (MongoWriteException lostTheInsertRace) {
+            return SaveResult.conflict(type, id, storedVersion(type, id));
+        }
+        if (updated == null) return SaveResult.conflict(type, id, storedVersion(type, id));
+        return SaveResult.saved(type, id, versionOf(updated));
     }
 
     @Override
     public VersionedData loadVersioned(String type, String id) {
         Document doc = collection(type).find(Filters.eq("_id", id)).first();
-        if (doc == null) return new VersionedData(null, 0);
+        if (doc == null) return new VersionedData(null, VersionedData.UNVERSIONED);
         Binary binary = doc.get("data", Binary.class);
-        Number version = (Number) doc.getOrDefault("version", 0L);
-        return new VersionedData(binary == null ? null : binary.getData(), version.longValue());
+        return new VersionedData(binary == null ? null : binary.getData(), versionOf(doc));
+    }
+
+    private static Bson writeAndBump(byte[] data) {
+        return Updates.combine(Updates.set("data", new Binary(data)), Updates.inc("version", 1L));
+    }
+
+    // The document body is the whole point of the collection; never ship it back just to read a
+    // counter off it.
+    private static FindOneAndUpdateOptions versionOnly() {
+        return new FindOneAndUpdateOptions()
+                .returnDocument(ReturnDocument.AFTER)
+                .projection(Projections.include("version"));
+    }
+
+    private long storedVersion(String type, String id) {
+        Document doc = collection(type).find(Filters.eq("_id", id))
+                .projection(Projections.include("version")).first();
+        return doc == null ? VersionedData.UNVERSIONED : versionOf(doc);
+    }
+
+    private static long versionOf(Document doc) {
+        Object version = doc.get("version");
+        return version instanceof Number number ? number.longValue() : VersionedData.UNVERSIONED;
     }
 
     @Override

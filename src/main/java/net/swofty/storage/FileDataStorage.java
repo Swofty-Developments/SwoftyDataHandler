@@ -9,8 +9,6 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Stream;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionStage;
 
 public class FileDataStorage implements DataStorage {
     private final Path baseDir;
@@ -45,17 +43,21 @@ public class FileDataStorage implements DataStorage {
     }
 
     @Override
-    public synchronized CompletionStage<SaveResult> save(String type, String id, byte[] data) {
-        Path path = resolvePath(type, id);
-        try {
-            Files.createDirectories(path.getParent());
-            Files.write(path, data);
-            long version = readVersion(type, id) + 1;
-            Files.writeString(versionPath(type, id), Long.toString(version));
-            return CompletableFuture.completedFuture(SaveResult.saved(type, id, version, data.length));
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
+    public synchronized void save(String type, String id, byte[] data) {
+        write(type, id, data, readVersion(type, id) + 1);
+    }
+
+    // Only a single JVM's writers are serialised here, so the compare and the write are atomic
+    // for this process and no further. Two processes over one directory still race.
+    @Override
+    public synchronized SaveResult saveIfVersion(String type, String id, byte[] data, long expectedVersion) {
+        long current = readVersion(type, id);
+        if (expectedVersion != VersionedData.ANY_VERSION && current != expectedVersion) {
+            return SaveResult.conflict(type, id, current);
         }
+        long version = current + 1;
+        write(type, id, data, version);
+        return SaveResult.saved(type, id, version);
     }
 
     @Override
@@ -63,13 +65,33 @@ public class FileDataStorage implements DataStorage {
         return new VersionedData(load(type, id), readVersion(type, id));
     }
 
-    private Path versionPath(String type, String id) { return baseDir.resolve(type).resolve(id + extension + ".version"); }
+    private void write(String type, String id, byte[] data, long version) {
+        Path path = resolvePath(type, id);
+        try {
+            Files.createDirectories(path.getParent());
+            Files.write(path, data);
+            Files.writeString(versionPath(type, id), Long.toString(version));
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    // The version lives beside the document rather than inside it, because the document bytes are
+    // the consumer's on-disk format and must stay byte-for-byte what the codecs wrote.
+    private Path versionPath(String type, String id) {
+        return baseDir.resolve(type).resolve(id + extension + ".version");
+    }
 
     private long readVersion(String type, String id) {
         Path path = versionPath(type, id);
-        if (!Files.exists(path)) return 0;
-        try { return Long.parseLong(Files.readString(path)); }
-        catch (IOException e) { throw new UncheckedIOException(e); }
+        if (!Files.exists(path)) return VersionedData.UNVERSIONED;
+        try {
+            return Long.parseLong(Files.readString(path).trim());
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        } catch (NumberFormatException corrupt) {
+            return VersionedData.UNVERSIONED;
+        }
     }
 
     @Override
