@@ -3,6 +3,7 @@ package net.swofty.event;
 import net.swofty.DataField;
 import net.swofty.LinkType;
 
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -12,9 +13,9 @@ import java.util.UUID;
  * no knowledge of how data is cached.
  */
 public interface RemoteChangeHandler {
-    <T> boolean onPlayerChange(DataField<T> field, UUID player, T newValue, long version);
+    <T> void onPlayerChange(DataField<T> field, UUID player, T newValue);
 
-    <T> boolean onLinkedChange(DataField<T> field, String linkTypeName, String linkKey, T newValue, long version);
+    <T> void onLinkedChange(DataField<T> field, String linkTypeName, String linkKey, T newValue);
 
     /** A player was linked on another node, so this node's link state can converge on it. */
     default <K> void onLinked(LinkType<K> type, UUID player, K linkKey) {}
@@ -22,7 +23,16 @@ public interface RemoteChangeHandler {
     /** A player was unlinked on another node. */
     default <K> void onUnlinked(LinkType<K> type, UUID player, K previousKey) {}
 
+    /** Another node flushed a whole document; this node rereads it if it caches the entity. */
     default void onPlayerSnapshot(UUID player, long version) {}
 
     default void onLinkedSnapshot(String linkTypeName, String linkKey, long version) {}
+
+    /**
+     * A shared entity's document was deleted on another node. Returns the players this node had
+     * linked to it, which the bus then reports to local link listeners.
+     */
+    default <K> Set<UUID> onLinkedDeleted(LinkType<K> type, K linkKey) {
+        return Set.of();
+    }
 }

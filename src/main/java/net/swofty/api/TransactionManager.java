@@ -61,8 +61,12 @@ class TransactionManager {
     }
 
     public <R> R execute(UUID player, TransactionFunction<R> action) {
-        try (DistributedLock.Handle handle = acquire("player:" + player)) {
+        String lockKey = "player:" + player;
+        // The lock key is recorded against this thread for the duration, so a write inside the body
+        // that would transparently take the same non-reentrant lock can ride this one instead.
+        try (DistributedLock.Handle handle = acquire(lockKey)) {
             synchronized (playerData.getLock(player)) {
+                LockScope.enter(lockKey);
                 refreshPlayer(player);
                 TransactionContext tx = new TransactionContext(player, null, null);
                 try {
@@ -76,34 +80,26 @@ class TransactionManager {
                 } catch (Exception e) {
                     tx.rollback();
                     throw e;
+                } finally {
+                    LockScope.exit(lockKey);
                 }
             }
         }
     }
 
     public void execute(UUID player, TransactionConsumer action) {
-        try (DistributedLock.Handle handle = acquire("player:" + player)) {
-            synchronized (playerData.getLock(player)) {
-                refreshPlayer(player);
-                TransactionContext tx = new TransactionContext(player, null, null);
-                try {
-                    action.accept(tx);
-                    handle.ensureValid();
-                    tx.commit();
-                } catch (TransactionAbortException e) {
-                    tx.rollback();
-                } catch (Exception e) {
-                    tx.rollback();
-                    throw e;
-                }
-            }
-        }
+        execute(player, tx -> {
+            action.accept(tx);
+            return null;
+        });
     }
 
     public <K, R> R executeDirect(K key, LinkType<K> type, TransactionFunction<R> action) {
         String ck = LinkedDataManager.compositeKey(type.name(), key);
-        try (DistributedLock.Handle handle = acquire("linked:" + ck)) {
+        String lockKey = "linked:" + ck;
+        try (DistributedLock.Handle handle = acquire(lockKey)) {
             synchronized (linkedData.getLock(ck)) {
+                LockScope.enter(lockKey);
                 refreshLinked(type.name(), key);
                 TransactionContext tx = new TransactionContext(null, type, key);
                 try {
@@ -117,6 +113,8 @@ class TransactionManager {
                 } catch (Exception e) {
                     tx.rollback();
                     throw e;
+                } finally {
+                    LockScope.exit(lockKey);
                 }
             }
         }
@@ -249,35 +247,41 @@ class TransactionManager {
             if (committed || rolledBack) return;
             committed = true;
 
-            // Apply player field changes
+            // Apply player field changes. Every field of the transaction lands in one document
+            // write, so they all carry that write's version; the bus orders per field, not per
+            // document, which is what lets all of them through on the receiving node.
+            long playerVersion = 0L;
             if (!newPlayerValues.isEmpty()) {
                 DataContainer playerContainer = playerData.getContainer(player);
                 for (Write write : newPlayerValues.values()) {
                     playerContainer.set((DataField<Object>) write.field(), write.value());
                 }
-                playerData.persist(player);
+                playerVersion = PlayerDataManager.eventVersion(playerData.persist(player));
             }
 
             // Apply linked field changes
-            for (Write write : newLinkedValues.values()) {
+            Map<String, Long> linkedVersions = new HashMap<>();
+            for (Map.Entry<String, Write> entry : newLinkedValues.entrySet()) {
+                Write write = entry.getValue();
                 LinkedField<Object, Object> field = (LinkedField<Object, Object>) write.field();
                 Object linkKey = resolveLink(field.linkType());
                 if (linkKey != null) {
-                    linkedData.setFieldValue(field.linkType().name(), linkKey, field, write.value());
+                    linkedVersions.put(entry.getKey(), PlayerDataManager.eventVersion(
+                            linkedData.setFieldValue(field.linkType().name(), linkKey, field, write.value())));
                 }
             }
 
-            fireEvents();
+            fireEvents(playerVersion, linkedVersions);
         }
 
         // A transactional write is still a write: without this, committed changes reached storage
         // but no listener ran locally, nothing was published, and peers kept serving stale caches.
         @SuppressWarnings("unchecked")
-        private void fireEvents() {
+        private void fireEvents(long playerVersion, Map<String, Long> linkedVersions) {
             for (Map.Entry<String, Write> entry : newPlayerValues.entrySet()) {
                 Write write = entry.getValue();
                 eventBus.firePlayerDataChanged((DataField<Object>) write.field(), player,
-                        originalPlayerValues.get(entry.getKey()), write.value(), playerData.currentVersion(player));
+                        originalPlayerValues.get(entry.getKey()), write.value(), playerVersion);
             }
 
             for (Map.Entry<String, Write> entry : newLinkedValues.entrySet()) {
@@ -288,7 +292,7 @@ class TransactionManager {
                 Set<UUID> affected = linkRegistry.getLinkedPlayers((LinkType<Object>) field.linkType(), linkKey);
                 eventBus.fireLinkedDataChanged(field, linkKey,
                         originalLinkedValues.get(entry.getKey()), write.value(), affected,
-                        linkedData.currentVersion(field.linkType().name(), linkKey));
+                        linkedVersions.getOrDefault(entry.getKey(), 0L));
             }
         }
 

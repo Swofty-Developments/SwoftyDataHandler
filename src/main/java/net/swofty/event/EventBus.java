@@ -128,6 +128,15 @@ public class EventBus {
     /** Signals that deferred linked changes were durably flushed as one document snapshot. */
     public void fireLinkedSnapshotSaved(String linkTypeName, Object linkKey, long version) {}
 
+    /** Signals that a shared entity's document was deleted outright. */
+    public <K> void fireLinkDeleted(LinkType<K> type, K linkKey) {}
+
+    /** Drops the per-entity ordering state kept for a player this node no longer caches. */
+    public void forgetPlayer(UUID player) {}
+
+    /** Drops the per-entity ordering state kept for a shared entity this node no longer caches. */
+    public void forgetLinked(String linkTypeName, Object linkKey) {}
+
     /**
      * Runs one listener in isolation. A listener that throws must not swallow the remaining
      * listeners, and on the distributed path an escaping exception would tear down the pub/sub
