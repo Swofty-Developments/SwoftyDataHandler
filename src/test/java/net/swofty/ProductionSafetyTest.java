@@ -45,9 +45,9 @@ class ProductionSafetyTest {
             assertTrue(storage.entered.await(5, TimeUnit.SECONDS));
             CompletableFuture<Void> second = api.loadAsync(player, executor);
             assertSame(first, second);
-            CompletionStage<SaveResult> unload = api.unloadAsync(player, executor);
+            CompletableFuture<Void> unload = api.unloadAsync(player, executor);
             storage.release.countDown();
-            unload.toCompletableFuture().get(5, TimeUnit.SECONDS);
+            unload.get(5, TimeUnit.SECONDS);
             assertEquals(1, storage.loads.get());
             assertFalse(api.isLoaded(player));
         } finally {
@@ -58,19 +58,18 @@ class ProductionSafetyTest {
     }
 
     @Test
-    void saveResultsAndSnapshotsExposeConfirmedVersions() {
+    void everyWriteAdvancesTheStoredDocumentVersion() {
         InMemoryDataStorage storage = new InMemoryDataStorage();
         DataAPI api = new DataAPIImpl(storage);
         UUID player = UUID.randomUUID();
         try {
-            SaveResult first = api.set(player, COINS, 1).toCompletableFuture().join();
-            SaveResult second = api.update(player, COINS, value -> value + 1).toCompletableFuture().join();
-            assertTrue(first.saved());
-            assertTrue(second.version() > first.version());
+            api.set(player, COINS, 1);
+            long first = storage.loadVersioned("players", player.toString()).version();
+            api.update(player, COINS, value -> value + 1);
+            long second = storage.loadVersioned("players", player.toString()).version();
 
-            StorageSnapshot snapshot = api.snapshot();
-            BatchSaveResult batch = api.saveSnapshot(snapshot).toCompletableFuture().join();
-            assertEquals(snapshot.documents().size(), batch.savedCount());
+            assertTrue(first > VersionedData.UNVERSIONED);
+            assertTrue(second > first);
         } finally {
             api.shutdown();
         }
@@ -112,7 +111,7 @@ class ProductionSafetyTest {
     }
 
     @Test
-    void deferredFlushPublishesVersionedSnapshotInvalidation() {
+    void deferredWritesStillReachPeersAndTheFlushMakesThemDurable() {
         class ImmediateChannel {
             final List<PubSubHandler.MessageHandler> handlers = new CopyOnWriteArrayList<>();
             PubSubHandler endpoint() { return new PubSubHandler() {
@@ -127,11 +126,15 @@ class ProductionSafetyTest {
         DataAPI reader = new DataAPIImpl(storage, channel.endpoint());
         UUID player = UUID.randomUUID();
         try {
+            reader.subscribe(COINS, (ignored, oldValue, newValue) -> {});
             reader.load(player);
             writer.set(player, COINS, 9);
-            assertEquals(0, reader.get(player, COINS));
-            writer.flush(player);
+            // A deferred write is still a change other nodes have to see; it just is not durable yet.
             assertEquals(9, reader.get(player, COINS));
+            assertNull(storage.load("players", player.toString()));
+
+            writer.flush(player);
+            assertTrue(storage.loadVersioned("players", player.toString()).version() > VersionedData.UNVERSIONED);
         } finally {
             writer.shutdown();
             reader.shutdown();
@@ -167,7 +170,7 @@ class ProductionSafetyTest {
 
     @Test
     void factoriesReturnFreshDefaultsAndOwnedStorageCloses() {
-        PlayerField<List<String>> field = PlayerField.<List<String>>builder(FieldKey.of("safe", "list"))
+        PlayerField<List<String>> field = PlayerField.<List<String>>builder("safe", "list")
                 .codec(Codecs.list(Codecs.STRING)).defaultFactory(ArrayList::new).build();
         assertNotSame(field.defaultValue(), field.defaultValue());
 

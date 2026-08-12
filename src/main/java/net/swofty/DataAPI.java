@@ -9,9 +9,7 @@ import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
-import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ForkJoinPool;
-import net.swofty.storage.*;
 import java.util.function.Predicate;
 import java.util.function.ToDoubleFunction;
 import java.util.function.UnaryOperator;
@@ -19,21 +17,21 @@ import java.util.function.UnaryOperator;
 public interface DataAPI extends AutoCloseable {
     // Player fields
     <T> T get(UUID player, PlayerField<T> field);
-    <T> CompletionStage<SaveResult> set(UUID player, PlayerField<T> field, T value);
-    <T> CompletionStage<SaveResult> update(UUID player, PlayerField<T> field, UnaryOperator<T> updater);
-    <T> CompletionStage<SaveResult> update(UUID player, PlayerField<T> field, UnaryOperator<T> updater, UpdateMode mode);
+    <T> void set(UUID player, PlayerField<T> field, T value);
+    <T> void update(UUID player, PlayerField<T> field, UnaryOperator<T> updater);
+    <T> void update(UUID player, PlayerField<T> field, UnaryOperator<T> updater, UpdateMode mode);
 
     // Linked fields (resolves via player's link key)
     <K, T> T get(UUID player, LinkedField<K, T> field);
-    <K, T> CompletionStage<SaveResult> set(UUID player, LinkedField<K, T> field, T value);
-    <K, T> CompletionStage<SaveResult> update(UUID player, LinkedField<K, T> field, UnaryOperator<T> updater);
-    <K, T> CompletionStage<SaveResult> update(UUID player, LinkedField<K, T> field, UnaryOperator<T> updater, UpdateMode mode);
+    <K, T> void set(UUID player, LinkedField<K, T> field, T value);
+    <K, T> void update(UUID player, LinkedField<K, T> field, UnaryOperator<T> updater);
+    <K, T> void update(UUID player, LinkedField<K, T> field, UnaryOperator<T> updater, UpdateMode mode);
 
     // Direct linked access (when you have the key)
     <K, T> T getDirect(K key, LinkedField<K, T> field);
-    <K, T> CompletionStage<SaveResult> setDirect(K key, LinkedField<K, T> field, T value);
-    <K, T> CompletionStage<SaveResult> updateDirect(K key, LinkedField<K, T> field, UnaryOperator<T> updater);
-    <K, T> CompletionStage<SaveResult> updateDirect(K key, LinkedField<K, T> field, UnaryOperator<T> updater, UpdateMode mode);
+    <K, T> void setDirect(K key, LinkedField<K, T> field, T value);
+    <K, T> void updateDirect(K key, LinkedField<K, T> field, UnaryOperator<T> updater);
+    <K, T> void updateDirect(K key, LinkedField<K, T> field, UnaryOperator<T> updater, UpdateMode mode);
 
     // Link management
     <K> void link(UUID player, LinkType<K> type, K key);
@@ -41,15 +39,15 @@ public interface DataAPI extends AutoCloseable {
     <K> Optional<K> getLinkKey(UUID player, LinkType<K> type);
 
     // Expiring fields
-    <T> CompletionStage<SaveResult> set(UUID player, ExpiringField<T> field, T value);
-    <T> CompletionStage<SaveResult> set(UUID player, ExpiringField<T> field, T value, Duration ttl);
+    <T> void set(UUID player, ExpiringField<T> field, T value);
+    <T> void set(UUID player, ExpiringField<T> field, T value, Duration ttl);
     <T> Optional<Duration> getTimeRemaining(UUID player, ExpiringField<T> field);
     <T> boolean isExpired(UUID player, ExpiringField<T> field);
     <T> void extend(UUID player, ExpiringField<T> field, Duration additional);
 
     // Expiring linked fields
-    <K, T> CompletionStage<SaveResult> set(UUID player, ExpiringLinkedField<K, T> field, T value);
-    <K, T> CompletionStage<SaveResult> set(UUID player, ExpiringLinkedField<K, T> field, T value, Duration ttl);
+    <K, T> void set(UUID player, ExpiringLinkedField<K, T> field, T value);
+    <K, T> void set(UUID player, ExpiringLinkedField<K, T> field, T value, Duration ttl);
 
     // Transactions
     <R> R transaction(UUID player, TransactionFunction<R> action);
@@ -91,38 +89,42 @@ public interface DataAPI extends AutoCloseable {
     // Lifecycle - warm a player's data into this node before use, evict it when done.
     // This is the primitive a proxy uses to load a player's data on the target server
     // BEFORE moving them there, and to evict it afterwards so a later visit is never stale.
+    // The async variants share one in-flight operation per player and stay ordered with each other.
     void load(UUID player);
     CompletableFuture<Void> loadAsync(UUID player, Executor executor);
     default CompletableFuture<Void> loadAsync(UUID player) { return loadAsync(player, ForkJoinPool.commonPool()); }
-    SaveResult flush(UUID player);
-    CompletionStage<SaveResult> flushAsync(UUID player, Executor executor);
-    default CompletionStage<SaveResult> flushAsync(UUID player) { return flushAsync(player, ForkJoinPool.commonPool()); }
-    SaveResult unload(UUID player);
-    CompletionStage<SaveResult> unloadAsync(UUID player, Executor executor);
-    default CompletionStage<SaveResult> unloadAsync(UUID player) { return unloadAsync(player, ForkJoinPool.commonPool()); }
+    void flush(UUID player);
+    CompletableFuture<Void> flushAsync(UUID player, Executor executor);
+    default CompletableFuture<Void> flushAsync(UUID player) { return flushAsync(player, ForkJoinPool.commonPool()); }
+    void unload(UUID player);
+    CompletableFuture<Void> unloadAsync(UUID player, Executor executor);
+    default CompletableFuture<Void> unloadAsync(UUID player) { return unloadAsync(player, ForkJoinPool.commonPool()); }
     boolean isLoaded(UUID player);
     Set<UUID> loadedPlayers();
 
     // Lifecycle - shared/linked entities (e.g. an island or coop shared across members)
     <K> void loadLink(LinkType<K> type, K key);
-    <K> SaveResult flushLink(LinkType<K> type, K key);
-    <K> CompletionStage<SaveResult> flushLinkAsync(LinkType<K> type, K key, Executor executor);
-    <K> SaveResult unloadLink(LinkType<K> type, K key);
-    <K> CompletionStage<SaveResult> unloadLinkAsync(LinkType<K> type, K key, Executor executor);
+    <K> void flushLink(LinkType<K> type, K key);
+    <K> void unloadLink(LinkType<K> type, K key);
     <K> boolean isLinkLoaded(LinkType<K> type, K key);
+
+    /**
+     * Deletes a shared entity outright: its document is removed from storage, every player linked
+     * to it is unlinked (here and on every other node), and the cached container is evicted
+     * cluster-wide. Unlinking the last member does not do this — the document is shared state that
+     * outlives its members — so a coop that is disbanded needs this or it lingers in storage
+     * forever.
+     */
+    <K> void deleteLink(LinkType<K> type, K key);
 
     // Distributed locking - takes the configured DistributedLock for an app-level critical section
     // that spans more than one field or entity. Use with try-with-resources; requires a lock to
     // have been supplied to the implementation.
     DistributedLock.Handle lock(String key, Duration timeout);
 
-    StorageSnapshot snapshot();
-    CompletionStage<BatchSaveResult> saveSnapshot(StorageSnapshot snapshot);
-    DataStorage storage();
-    StorageOwnership storageOwnership();
-
     // Flushes deferred writes, stops expiration timers and closes pub/sub subscribers.
     void shutdown();
 
-    @Override default void close() { shutdown(); }
+    @Override
+    default void close() { shutdown(); }
 }
