@@ -56,23 +56,29 @@ int coins = api.get(player, COINS); // 600
 
 ## Storage Backends
 
-| Backend | Persistence | Multi-server | Event listeners |
-|---------|------------|-------------|-----------------|
+| Backend | Persistence | Shared across servers | Indexed leaderboards |
+|---------|------------|----------------------|----------------------|
 | `InMemoryDataStorage` | No | No | Yes |
-| `FileDataStorage` | Yes (local files) | No | **No** |
+| `FileDataStorage` | Yes (local files) | No | No |
 | `RedisDataStorage` | Yes (Redis) | Yes | Yes |
+| `MongoDataStorage` | Yes (MongoDB) | Yes | No |
 
-`FileDataStorage` does not support event listeners. Calling `subscribe` on a `DataAPI` backed by file storage throws `UnsupportedOperationException`.
+Event listeners are fired by the API, not by the storage, so they work with **every** backend --
+including `FileDataStorage`. What storage decides is whether other servers can see the same data;
+delivering events *between* servers is a separate concern, handled by a `PubSubHandler`
+(see [Cross-Server Events](#cross-server-events-redis)).
 
 ```java
 // File storage with custom format and extension
 new FileDataStorage(basePath, new JsonFormat(), ".json")
-new FileDataStorage(basePath, new BinaryFormat(), ".dat")
 
 // Redis with connection pool
 JedisPool pool = new JedisPool("localhost", 6379);
 new RedisDataStorage(pool)
 new RedisDataStorage(pool, "myapp:data") // custom key prefix
+
+// Mongo, from a client or an existing database handle
+new MongoDataStorage(mongoClient, "myapp")
 ```
 
 ## Player Fields
@@ -129,6 +135,10 @@ long bank = api.get(player2, ISLAND_BANK); // 1000 -- same data
 // e.g. updating island data from a scheduled task or admin command
 api.setDirect(islandId, ISLAND_LEVEL, 5);
 ```
+
+`link` persists the key on the player's own document, so a server that never ran `link` for that
+player (a freshly started node, or the one they just moved to) recovers it from storage on first
+use: `getLinkKey` and every player-based linked read or write resolve without re-linking.
 
 ## Codecs
 
@@ -254,16 +264,23 @@ api.transaction(player, tx -> {
     tx.set(NAME, "NewName");
 });
 
-// Direct transaction on linked data
-api.transactionDirect(islandId, ISLAND, tx -> {
-    tx.update(ISLAND_BANK, bank -> bank - 1000L);
-    return null;
+// Direct transaction on linked data -- operates on the key you pass, no player involved
+long remaining = api.transactionDirect(islandId, ISLAND, tx -> {
+    long bank = tx.get(ISLAND_BANK) - 1000L;
+    tx.set(ISLAND_BANK, bank);
+    return bank;
 });
 ```
 
+A direct transaction is bound to the one link key it was given: linked fields of that link type
+resolve against it, and player fields are not available inside it (there is no player to resolve
+them for). Committed transactions fire the same events a direct `set` would, so listeners run and
+other nodes refresh their caches.
+
 ## Event Listeners
 
-Subscribe to data changes. **Requires a storage backend that supports listeners** (Redis or InMemory -- not File).
+Subscribe to data changes. Listeners are fired by the API itself, so they work with any storage
+backend. A listener that throws is logged and skipped -- the remaining listeners still run.
 
 ```java
 // Player field changes
@@ -286,27 +303,39 @@ api.subscribe(ISLAND, new LinkChangeListener<UUID>() {
     }
 });
 
-// Expiration events
+// Expiration events -- fired by the expiration sweep with the value that expired
 api.subscribeExpiration(ACTIVE_BOOST, (player, field, expiredValue) -> {
     System.out.println(player + "'s boost expired: " + expiredValue);
+});
+
+// Linked expiration events also carry the affected members
+api.subscribeExpiration(ISLAND_BUFF, (islandId, field, expiredValue, memberIds) -> {
+    System.out.println("Island " + islandId + " lost its buff: " + expiredValue);
 });
 ```
 
 ### Cross-Server Events (Redis)
 
-When using `RedisDataStorage`, events are automatically distributed across all server instances via Redis Pub/Sub. A change on Server A fires listeners on Server B.
+Events are distributed across server instances by a `PubSubHandler`, which you pass explicitly --
+storage alone does not distribute them. With one supplied, a change on Server A fires listeners on
+Server B, and Server B's cached copy of the changed field is refreshed in place.
 
 ```java
+JedisPool pool = new JedisPool("redis-host", 6379);
+
 // Server A
-DataAPI apiA = new DataAPIImpl(new RedisDataStorage("redis-host", 6379));
+DataAPI apiA = new DataAPIImpl(new RedisDataStorage(pool), new JsonFormat(), new RedisPubSubHandler(pool));
 apiA.set(player, COINS, 1000);
 
 // Server B -- listener fires automatically
-DataAPI apiB = new DataAPIImpl(new RedisDataStorage("redis-host", 6379));
+DataAPI apiB = new DataAPIImpl(new RedisDataStorage(pool), new JsonFormat(), new RedisPubSubHandler(pool));
 apiB.subscribe(COINS, (p, old, nw) -> {
     // This fires when Server A changes the value
 });
 ```
+
+Without a `PubSubHandler` (e.g. `new DataAPIImpl(storage)`) listeners are local to the process that
+made the change. `KeyDBPubSubHandler` is the same handler for KeyDB.
 
 ## Bulk Operations
 
@@ -361,11 +390,15 @@ int reset = api.updateWhere(COINS, c -> c < 0, c -> 0); // fix negative balances
 Two serialization formats are included:
 
 ```java
-new JsonFormat()   // human-readable, good for debugging
-new BinaryFormat() // compact, good for production
+new JsonFormat()   // human-readable, and the format the API stores documents in
+new BinaryFormat() // compact, sequential -- for reading and writing values yourself
 ```
 
-Both implement `DataFormat` and can be used with any storage backend.
+Entity documents hold many fields at once, so the format backing a `DataAPI` must support
+whole-document access (`readRaw`/`writeRaw`). `JsonFormat` does; `BinaryFormat` is purely
+sequential and does not, so passing it to a `DataAPI` makes writes throw
+`UnsupportedOperationException`. Use `BinaryFormat` with codecs directly when you need a compact
+encoding of a single value, and leave the API on `JsonFormat`.
 
 ## Multi-Server Lifecycle
 
@@ -419,7 +452,7 @@ DataAPI api = new DataAPIImpl(storage, new JsonFormat(), pubSub, true, lock);
 api.transactionDirect(coopId, COOP, tx -> { tx.update(BANK, b -> b - 1000L); return null; });
 
 // The same primitive is available for app-level critical sections:
-try (var handle = ((DataAPIImpl) api).lock("coop-transfer:" + coopId, Duration.ofSeconds(5))) {
+try (var handle = api.lock("coop-transfer:" + coopId, Duration.ofSeconds(5))) {
     // ... multi-entity critical section ...
 }
 ```
