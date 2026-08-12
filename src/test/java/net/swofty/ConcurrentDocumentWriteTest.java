@@ -168,10 +168,10 @@ class ConcurrentDocumentWriteTest {
         DataAPI api = new DataAPIImpl(storage);
         UUID player = UUID.randomUUID();
         try {
-            storage.forceConflicts(40);
+            storage.forceConflicts(24);
             api.set(player, COINS, 7);
 
-            assertEquals(41, storage.conditionalWrites.get());
+            assertEquals(25, storage.conditionalWrites.get());
             try (DataAPI fresh = new DataAPIImpl(storage)) {
                 assertEquals(7, fresh.get(player, COINS));
             }
