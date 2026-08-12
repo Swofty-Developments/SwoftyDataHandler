@@ -9,14 +9,19 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.*;
 
 class ExpirationManager {
-    private final ConcurrentHashMap<String, Instant> expirations = new ConcurrentHashMap<>();
+    private static final System.Logger LOGGER = System.getLogger(ExpirationManager.class.getName());
+
+    private final ConcurrentHashMap<String, Expiration> expirations = new ConcurrentHashMap<>();
+    private final EventBus eventBus;
     private final ScheduledExecutorService scheduler;
 
-    public ExpirationManager() {
+    public ExpirationManager(EventBus eventBus) {
+        this.eventBus = eventBus;
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "DataHandler-Expiration");
             t.setDaemon(true);
@@ -25,38 +30,46 @@ class ExpirationManager {
         this.scheduler.scheduleAtFixedRate(this::checkExpirations, 1, 1, TimeUnit.SECONDS);
     }
 
-    public <T> void setExpiration(UUID player, ExpiringField<T> field, Duration ttl) {
-        expirations.put(playerKey(player, field), Instant.now().plus(ttl));
+    // The value (and, for linked fields, the members) is captured when the expiration is
+    // registered, because by the time it fires the field already reads as its default.
+    private record Expiration(Instant expiry, Runnable fire) {}
+
+    public <T> void setExpiration(UUID player, ExpiringField<T> field, Duration ttl, T value) {
+        expirations.put(playerKey(player, field), new Expiration(Instant.now().plus(ttl),
+                () -> eventBus.fireExpired(field, player, value)));
     }
 
     public <T> boolean isExpired(UUID player, ExpiringField<T> field) {
-        Instant expiry = expirations.get(playerKey(player, field));
-        return expiry == null || Instant.now().isAfter(expiry);
+        Expiration expiration = expirations.get(playerKey(player, field));
+        return expiration == null || Instant.now().isAfter(expiration.expiry());
     }
 
     public <T> Optional<Duration> getTimeRemaining(UUID player, ExpiringField<T> field) {
-        Instant expiry = expirations.get(playerKey(player, field));
-        if (expiry == null) return Optional.empty();
-        Duration remaining = Duration.between(Instant.now(), expiry);
+        Expiration expiration = expirations.get(playerKey(player, field));
+        if (expiration == null) return Optional.empty();
+        Duration remaining = Duration.between(Instant.now(), expiration.expiry());
         return remaining.isNegative() ? Optional.empty() : Optional.of(remaining);
     }
 
     public <T> void extend(UUID player, ExpiringField<T> field, Duration additional) {
         String key = playerKey(player, field);
-        Instant expiry = expirations.get(key);
-        if (expiry == null || Instant.now().isAfter(expiry)) {
+        Expiration expiration = expirations.get(key);
+        if (expiration == null || Instant.now().isAfter(expiration.expiry())) {
             throw new IllegalStateException("No active expiration to extend");
         }
-        expirations.put(key, expiry.plus(additional));
+        expirations.put(key, new Expiration(expiration.expiry().plus(additional), expiration.fire()));
     }
 
-    public void setLinkedExpiration(String linkTypeName, Object linkKey, DataField<?> field, Duration ttl) {
-        expirations.put(linkedKey(linkTypeName, linkKey, field), Instant.now().plus(ttl));
+    public <K, T> void setLinkedExpiration(ExpiringLinkedField<K, T> field, K linkKey, Duration ttl,
+                                           T value, Set<UUID> memberIds) {
+        expirations.put(linkedKey(field.linkType().name(), linkKey, field),
+                new Expiration(Instant.now().plus(ttl),
+                        () -> eventBus.fireLinkedExpired(field, linkKey, value, memberIds)));
     }
 
     public boolean isLinkedExpired(String linkTypeName, Object linkKey, DataField<?> field) {
-        Instant expiry = expirations.get(linkedKey(linkTypeName, linkKey, field));
-        return expiry == null || Instant.now().isAfter(expiry);
+        Expiration expiration = expirations.get(linkedKey(linkTypeName, linkKey, field));
+        return expiration == null || Instant.now().isAfter(expiration.expiry());
     }
 
     public void shutdown() {
@@ -73,6 +86,17 @@ class ExpirationManager {
 
     private void checkExpirations() {
         Instant now = Instant.now();
-        expirations.entrySet().removeIf(entry -> now.isAfter(entry.getValue()));
+        for (Map.Entry<String, Expiration> entry : expirations.entrySet()) {
+            Expiration expiration = entry.getValue();
+            if (!now.isAfter(expiration.expiry())) continue;
+            // Drop it first, and only fire if this thread is the one that removed the entry we
+            // looked at, so an expiration extended in the meantime is neither lost nor fired.
+            if (!expirations.remove(entry.getKey(), expiration)) continue;
+            try {
+                expiration.fire().run();
+            } catch (RuntimeException e) {
+                LOGGER.log(System.Logger.Level.ERROR, "Failed to fire expiration for " + entry.getKey(), e);
+            }
+        }
     }
 }

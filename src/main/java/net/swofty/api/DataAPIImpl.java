@@ -54,7 +54,7 @@ public class DataAPIImpl implements DataAPI {
         // the player itself can still recover the key instead of behaving as if they had no link.
         this.linkRegistry.setKeyLoader(playerData::loadLinkKey);
         this.linkedData = new LinkedDataManager(storage, format, eventBus, linkRegistry, autoPersist);
-        this.expirationManager = new ExpirationManager();
+        this.expirationManager = new ExpirationManager(eventBus);
         this.transactionManager = new TransactionManager(playerData, linkedData, linkRegistry, eventBus,
                 distributedLock, Duration.ofSeconds(10));
         this.bulkOperations = new BulkOperationExecutor(playerData, linkedData, storage, eventBus);
@@ -187,7 +187,7 @@ public class DataAPIImpl implements DataAPI {
         synchronized (playerData.getLock(player)) {
             T oldValue = playerData.getFieldValue(player, field);
             playerData.setFieldValue(player, field, value);
-            expirationManager.setExpiration(player, field, ttl);
+            expirationManager.setExpiration(player, field, ttl, value);
             eventBus.firePlayerDataChanged(field, player, oldValue, value);
         }
     }
@@ -223,8 +223,8 @@ public class DataAPIImpl implements DataAPI {
         synchronized (linkedData.getLock(ck)) {
             T oldValue = linkedData.getFieldValue(field.linkType().name(), linkKey, field);
             linkedData.setFieldValue(field.linkType().name(), linkKey, field, value);
-            expirationManager.setLinkedExpiration(field.linkType().name(), linkKey, field, ttl);
             Set<UUID> affected = linkRegistry.getLinkedPlayers(field.linkType(), linkKey);
+            expirationManager.setLinkedExpiration(field, linkKey, ttl, value, affected);
             eventBus.fireLinkedDataChanged(field, linkKey, oldValue, value, affected);
         }
     }
