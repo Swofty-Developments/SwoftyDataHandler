@@ -104,11 +104,31 @@ class DataContainer {
      * Applies a value that another node has already persisted. Updates the live view so
      * local reads are fresh, but preserves the prior dirty state so a clean (e.g. read-only)
      * container does not get marked dirty and re-persist stale sibling fields on unload.
+     *
+     * <p>The backing document is patched with the same value, so it stays an accurate picture
+     * of what is in storage: a later local write merges over a base that already carries the
+     * remote change instead of resurrecting the value this node last saw.
      */
-    public <T> void applyRemote(DataField<T> field, T value) {
+    public <T> void applyRemote(DataField<T> field, T value, DataFormat format) {
         boolean wasDirty = this.dirty;
         set(field, value);
         this.dirty = wasDirty;
+        patchBackingDocument(field.fullKey(), value, format);
+    }
+
+    // Stores the value exactly as serialize() would — the live object, written out by the
+    // format's whole-document writer — so the patched document round-trips like any other.
+    private void patchBackingDocument(String fullKey, Object value, DataFormat format) {
+        if (!documentLoaded) return;
+        Map<String, Object> document = backingDocument == null
+                ? new LinkedHashMap<>()
+                : format.readRaw(backingDocument);
+        if (value == null) {
+            document.remove(fullKey);
+        } else {
+            document.put(fullKey, value);
+        }
+        this.backingDocument = format.writeRaw(document);
     }
 
     /** Records the bytes just written to storage as the new backing document and clears the dirty flag. */

@@ -240,7 +240,7 @@ class PlayerDataManager {
         synchronized (getLock(player)) {
             container = cache.get(player);
             if (container == null) return;
-            container.applyRemote(field, newValue);
+            container.applyRemote(field, newValue, format);
         }
     }
 

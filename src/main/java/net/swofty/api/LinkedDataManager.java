@@ -212,7 +212,7 @@ class LinkedDataManager {
         synchronized (getLock(ck)) {
             container = cache.get(ck);
             if (container == null) return;
-            container.applyRemote(field, newValue);
+            container.applyRemote(field, newValue, format);
         }
     }
 
