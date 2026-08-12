@@ -118,9 +118,25 @@ no coordination, no lock and no pub/sub message required.
 | `InMemoryDataStorage` | per-key counter | compare and write under the key's monitor |
 | `FileDataStorage` | `<id><ext>.version` sidecar | compare and write under the instance monitor (one JVM only) |
 
-Retries are bounded (8 attempts, with a short randomised backoff). A document under permanent
-contention resolves as last-writer-wins and says so at `WARNING`, because blocking the calling
-thread forever is worse than losing a write loudly.
+The retry loop has no give-up path, and deliberately so: a write that eventually gave up and
+overwrote the document would erase whatever a peer wrote in the meantime, which is the exact bug
+the comparison exists to prevent and is likeliest precisely when contention is high. It cannot spin
+indefinitely either, because every conflict means some other writer committed. Retries back off
+with jitter and log at `WARNING` if a document keeps losing.
+
+**What this does and does not give you.** Concurrent writes to *different* fields of one document
+both survive. Concurrent read-modify-write of the *same* field is still last-writer-wins: two nodes
+that read `coins = 10` and both write `11` merge cleanly to `11`, because merging is per field and
+neither node knows the other counted. If a field must be incremented from more than one node at
+once, serialise it:
+
+```java
+api.update(player, COINS, c -> c + 100, UpdateMode.DISTRIBUTED); // rereads under the entity's lock
+api.transaction(player, tx -> tx.update(COINS, c -> c + 100));   // same, for several fields at once
+```
+
+Both require a `DistributedLock` (see [Distributed Locking](#distributed-locking)); without one they
+serialise threads in this JVM only.
 
 A storage written against 1.4.x keeps working unchanged: `loadVersioned` and `saveIfVersion` are
 defaulted, and a backend that does not implement them reports "unversioned", which degrades every
@@ -404,7 +420,11 @@ published unversioned and always delivered; its later `flush` publishes a snapsh
 makes peers reread the whole document.
 
 The per-entity ordering state is dropped when the entity is unloaded, and capped so a node that
-only ever *hears* about entities cannot grow without bound.
+only ever *hears* about entities cannot grow without bound. The cap never reaches an entity that is
+currently loaded here: dropping the ordering state for a player this node is serving would let a
+replayed older event revert them, and the next local write would make that durable. So the bound is
+"4096 entities this node does not cache, plus however many it does" — the latter being bounded by
+the node itself.
 
 ## Bulk Operations
 
@@ -553,10 +573,18 @@ lose it halfway through.
 Renewal can still fail — the process stalls, the connection breaks, the key is force-deleted — and
 `Handle.isValid()` / `Handle.ensureValid()` report that. **`ensureValid()` is best-effort**: it says
 the lease was still held a moment ago, not that it will still be held while the next write lands.
-`Handle.fencingToken()` is published for callers that need a real guarantee and can reject stale
-writes at the storage layer; **this library does not enforce the token on its own writes**. What
-does protect the data across nodes is the compare-and-set write path above, which is enforced
-unconditionally.
+
+`Handle.fencingToken()` increases for successive holders of a key, and keeps increasing even after
+the fence counter is reclaimed (it expires after a long idle window rather than living forever),
+because a fresh counter is seeded from the wall clock rather than from zero — so it does not require
+node clocks to agree, only that none of them runs backwards across that window. **The library never enforces the token on its own writes.** If you
+want fencing, you have to compare it yourself at your own storage layer. What protects data across
+nodes here is the compare-and-set write path above, which is enforced unconditionally and needs no
+lock at all.
+
+`RedisDistributedLock` owns a daemon thread for renewals. A `BORROWED` lock (the default) is left
+alone by `shutdown()`, so that thread lives until you call `close()` on the lock yourself, or hand
+it to the API as `OWNED`.
 
 How long a transaction (or a `DISTRIBUTED` write, below) waits for an entity's lock is
 configurable, and defaults to 10 seconds:

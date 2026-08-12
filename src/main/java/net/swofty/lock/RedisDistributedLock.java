@@ -23,14 +23,19 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * connection breaks, the key is force-deleted — which is what {@link Handle#isValid()} and
  * {@link Handle#ensureValid()} report. That check is best-effort by construction: it tells you the
  * lease was still held a moment ago, not that it will still be held while the next write lands.
- * {@link Handle#fencingToken()} is published for callers that need a real guarantee and can reject
- * stale writes at the storage layer; this library does not enforce it on its own writes.
+ * {@link Handle#fencingToken()} is published for callers that want to reject stale writes at their
+ * own storage layer. It increases for successive holders of a key, and survives the fence counter
+ * being reclaimed because a fresh counter is seeded from the wall clock rather than from zero, so
+ * it does not depend on node clocks agreeing - only on none of them running backwards across the
+ * reclamation window, which is two orders of magnitude longer than a lease. This library never enforces it on its own writes; what protects data across
+ * nodes here is the compare-and-set write path, not the lock.
  */
 public class RedisDistributedLock implements DistributedLock, AutoCloseable {
     private static final String UNLOCK_SCRIPT =
             "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
     private static final String ACQUIRE_SCRIPT =
             "if redis.call('set', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then "
+            + "if redis.call('exists', KEYS[2]) == 0 then redis.call('set', KEYS[2], ARGV[4]) end "
             + "local fence = redis.call('incr', KEYS[2]); redis.call('expire', KEYS[2], ARGV[3]); "
             + "return fence else return 0 end";
     private static final String RENEW_SCRIPT =
@@ -38,7 +43,9 @@ public class RedisDistributedLock implements DistributedLock, AutoCloseable {
 
     // The fence counter has to outlive every holder that could still be in flight, but not the
     // cluster: an un-expiring counter per lock key is a permanent leak in a keyspace with one key
-    // per player.
+    // per player. A counter that expires and restarts at 1 would hand out tokens it has already
+    // issued, so a fresh counter is seeded from the wall clock instead of from zero, which keeps it
+    // increasing across the gap for any node whose clock is not running backwards.
     private static final long FENCE_TTL_MULTIPLIER = 100L;
 
     private final JedisPool pool;
@@ -78,7 +85,7 @@ public class RedisDistributedLock implements DistributedLock, AutoCloseable {
         while (true) {
             try (Jedis jedis = pool.getResource()) {
                 Object acquired = jedis.eval(ACQUIRE_SCRIPT, List.of(redisKey, fenceKey),
-                        List.of(token, leaseMillis, fenceTtlSeconds));
+                        List.of(token, leaseMillis, fenceTtlSeconds, freshFenceSeed()));
                 long fence = acquired instanceof Number number ? number.longValue() : 0L;
                 if (fence > 0) {
                     return new RedisHandle(redisKey, token, fence);
@@ -94,6 +101,13 @@ public class RedisDistributedLock implements DistributedLock, AutoCloseable {
                 throw new LockAcquisitionException("Interrupted acquiring lock: " + key);
             }
         }
+    }
+
+    // Scaled off milliseconds so a reclaimed counter starts well clear of the tokens the previous
+    // counter had issued: it would take a thousand acquisitions of one key inside a single
+    // millisecond to catch up, and every acquisition is a round trip to Redis.
+    private static String freshFenceSeed() {
+        return Long.toString(System.currentTimeMillis() * 1_000L);
     }
 
     private void release(String redisKey, String token) {
