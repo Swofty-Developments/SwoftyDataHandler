@@ -123,12 +123,20 @@ class ConcurrentDocumentWriteTest {
         }
     }
 
+    // Stands in for what a real backend throws when it cannot reach the server, e.g. Jedis'
+    // JedisConnectionException: a plain RuntimeException, not one of the API's own contract types.
+    private static final class StorageUnavailableException extends RuntimeException {
+        StorageUnavailableException() {
+            super("redis down");
+        }
+    }
+
     @Test
     void aStorageFailureOnWriteReachesTheCallerSynchronously() {
         class BrokenStorage extends InMemoryDataStorage {
             @Override
             public SaveResult saveIfVersion(String type, String id, byte[] data, long expectedVersion) {
-                throw new IllegalStateException("redis down");
+                throw new StorageUnavailableException();
             }
         }
 
@@ -138,10 +146,10 @@ class ConcurrentDocumentWriteTest {
         // A write that never reached storage has to be a failure the caller sees, on the thread
         // that asked for it. Handing back a future nobody looks at turns an outage into silence.
         assertEquals("redis down",
-                assertThrows(IllegalStateException.class, () -> api.set(player, COINS, 1)).getMessage());
+                assertThrows(StorageUnavailableException.class, () -> api.set(player, COINS, 1)).getMessage());
         assertEquals("redis down",
-                assertThrows(IllegalStateException.class, () -> api.update(player, COINS, c -> c + 1)).getMessage());
-        assertThrows(IllegalStateException.class, api::shutdown);
+                assertThrows(StorageUnavailableException.class, () -> api.update(player, COINS, c -> c + 1)).getMessage());
+        assertThrows(StorageUnavailableException.class, api::shutdown);
     }
 
     @Test
@@ -151,7 +159,7 @@ class ConcurrentDocumentWriteTest {
 
             @Override
             public SaveResult saveIfVersion(String type, String id, byte[] data, long expectedVersion) {
-                if (broken) throw new IllegalStateException("redis down");
+                if (broken) throw new StorageUnavailableException();
                 return super.saveIfVersion(type, id, data, expectedVersion);
             }
         }
@@ -163,7 +171,7 @@ class ConcurrentDocumentWriteTest {
             api.set(player, COINS, 1);
             storage.broken = true;
             assertEquals("redis down",
-                    assertThrows(IllegalStateException.class, () -> api.flush(player)).getMessage());
+                    assertThrows(StorageUnavailableException.class, () -> api.flush(player)).getMessage());
         } finally {
             storage.broken = false;
             api.shutdown();
