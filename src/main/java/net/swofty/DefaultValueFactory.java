@@ -1,43 +1,18 @@
 package net.swofty;
 
-import net.swofty.codec.Codec;
-import net.swofty.data.DataWriter;
-import net.swofty.data.format.BinaryFormat;
-
-/** Creates a fresh default value for a field. */
+/**
+ * Creates the value a field reads as when nothing is stored for it.
+ *
+ * <p>{@code defaultValue(x)} on a field builder hands back the same {@code x} every time, which is
+ * what a shared immutable default should do. A mutable default (a list, a map, a record holding
+ * one) must not be shared between entities: give the builder a {@code defaultFactory} instead so
+ * every miss gets its own instance.
+ */
 @FunctionalInterface
 public interface DefaultValueFactory<T> {
     T create();
 
     static <T> DefaultValueFactory<T> constant(T value) {
         return () -> value;
-    }
-
-    /** Builds defaults by codec round-trip, preventing mutable prototypes from being shared. */
-    static <T> DefaultValueFactory<T> copying(Codec<T> codec, T prototype) {
-        java.util.Objects.requireNonNull(codec, "codec");
-        if (prototype == null) return () -> null;
-        BinaryFormat format = new BinaryFormat();
-        DataWriter writer = format.createWriter();
-        codec.write(writer, prototype);
-        byte[] encoded = format.toBytes(writer);
-        return () -> codec.read(format.createReader(encoded));
-    }
-
-    static <T> DefaultValueFactory<T> copying(java.util.function.Supplier<Codec<T>> codec, T prototype) {
-        java.util.Objects.requireNonNull(codec, "codec");
-        return new DefaultValueFactory<>() {
-            private volatile DefaultValueFactory<T> delegate;
-            @Override public T create() {
-                DefaultValueFactory<T> current = delegate;
-                if (current == null) {
-                    synchronized (this) {
-                        current = delegate;
-                        if (current == null) delegate = current = copying(codec.get(), prototype);
-                    }
-                }
-                return current.create();
-            }
-        };
     }
 }

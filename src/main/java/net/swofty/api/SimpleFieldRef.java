@@ -9,18 +9,30 @@ import net.swofty.codec.Codec;
  * key with the link type's key codec rather than the declared field codec.
  */
 class SimpleFieldRef<T> implements DataField<T> {
-    private final net.swofty.FieldKey<T> fieldKey;
+    private final String fullKey;
     private final Codec<T> codec;
 
     SimpleFieldRef(String fullKey, Codec<T> codec) {
-        int idx = fullKey.indexOf(':');
-        this.fieldKey = net.swofty.FieldKey.of(idx >= 0 ? fullKey.substring(0, idx) : "internal",
-                idx >= 0 ? fullKey.substring(idx + 1) : fullKey);
+        this.fullKey = fullKey;
         this.codec = codec;
     }
 
     @Override
-    public net.swofty.FieldKey<T> fieldKey() { return fieldKey; }
+    public String namespace() {
+        int idx = fullKey.indexOf(':');
+        return idx >= 0 ? fullKey.substring(0, idx) : "";
+    }
+
+    @Override
+    public String key() {
+        int idx = fullKey.indexOf(':');
+        return idx >= 0 ? fullKey.substring(idx + 1) : fullKey;
+    }
+
+    @Override
+    public String fullKey() {
+        return fullKey;
+    }
 
     @Override
     public Codec<T> codec() {

@@ -4,7 +4,8 @@ import net.swofty.codec.Codec;
 import net.swofty.validation.Validator;
 
 public class LinkedField<K, T> implements DataField<T> {
-    private final FieldKey<T> fieldKey;
+    private final String namespace;
+    private final String key;
     private final Codec<T> codec;
     private final DefaultValueFactory<? extends T> defaultFactory;
     private final LinkType<K> linkType;
@@ -12,14 +13,16 @@ public class LinkedField<K, T> implements DataField<T> {
 
     protected LinkedField(String namespace, String key, Codec<T> codec, T defaultValue,
                            LinkType<K> linkType, Validator<T> validator) {
-        this(FieldKey.of(namespace, key), codec, DefaultValueFactory.copying(codec, defaultValue), linkType, validator);
+        this(namespace, key, codec, DefaultValueFactory.constant(defaultValue), linkType, validator);
     }
 
-    protected LinkedField(FieldKey<T> fieldKey, Codec<T> codec, DefaultValueFactory<? extends T> defaultFactory,
+    protected LinkedField(String namespace, String key, Codec<T> codec,
+                          DefaultValueFactory<? extends T> defaultFactory,
                           LinkType<K> linkType, Validator<T> validator) {
-        this.fieldKey = java.util.Objects.requireNonNull(fieldKey, "fieldKey");
+        this.namespace = namespace;
+        this.key = key;
         this.codec = codec;
-        this.defaultFactory = java.util.Objects.requireNonNull(defaultFactory, "defaultFactory");
+        this.defaultFactory = defaultFactory;
         this.linkType = linkType;
         this.validator = validator;
     }
@@ -30,15 +33,18 @@ public class LinkedField<K, T> implements DataField<T> {
     }
 
     public static <K, T> Builder<K, T> builder(String namespace, String key, LinkType<K> linkType) {
-        return new Builder<>(FieldKey.of(namespace, key), linkType);
-    }
-
-    public static <K, T> Builder<K, T> builder(FieldKey<T> key, LinkType<K> linkType) {
-        return new Builder<>(key, linkType);
+        return new Builder<>(namespace, key, linkType);
     }
 
     @Override
-    public FieldKey<T> fieldKey() { return fieldKey; }
+    public String namespace() {
+        return namespace;
+    }
+
+    @Override
+    public String key() {
+        return key;
+    }
 
     @Override
     public Codec<T> codec() {
@@ -59,14 +65,16 @@ public class LinkedField<K, T> implements DataField<T> {
     }
 
     public static class Builder<K, T> {
-        private final FieldKey<T> fieldKey;
+        private final String namespace;
+        private final String key;
         private final LinkType<K> linkType;
         private Codec<T> codec;
-        private DefaultValueFactory<? extends T> defaultFactory = () -> null;
+        private DefaultValueFactory<? extends T> defaultFactory = DefaultValueFactory.constant(null);
         private Validator<T> validator;
 
-        private Builder(FieldKey<T> fieldKey, LinkType<K> linkType) {
-            this.fieldKey = fieldKey;
+        private Builder(String namespace, String key, LinkType<K> linkType) {
+            this.namespace = namespace;
+            this.key = key;
             this.linkType = linkType;
         }
 
@@ -76,10 +84,14 @@ public class LinkedField<K, T> implements DataField<T> {
         }
 
         public Builder<K, T> defaultValue(T defaultValue) {
-            this.defaultFactory = DefaultValueFactory.copying(() -> codec, defaultValue);
+            this.defaultFactory = DefaultValueFactory.constant(defaultValue);
             return this;
         }
 
+        /**
+         * Produces a fresh default on every miss, for mutable defaults that must not be shared.
+         * {@link #defaultValue(Object)} keeps returning the one constant it was given.
+         */
         public Builder<K, T> defaultFactory(DefaultValueFactory<? extends T> factory) {
             this.defaultFactory = java.util.Objects.requireNonNull(factory, "factory");
             return this;
@@ -91,8 +103,7 @@ public class LinkedField<K, T> implements DataField<T> {
         }
 
         public LinkedField<K, T> build() {
-            return new LinkedField<>(fieldKey, java.util.Objects.requireNonNull(codec, "codec"),
-                    defaultFactory, linkType, validator);
+            return new LinkedField<>(namespace, key, codec, defaultFactory, linkType, validator);
         }
     }
 }
