@@ -27,15 +27,30 @@ class DistributedConvergenceTest {
 
     private static final class LoopbackChannel {
         private final List<PubSubHandler.MessageHandler> handlers = new CopyOnWriteArrayList<>();
+        private final List<String> published = new CopyOnWriteArrayList<>();
         private volatile boolean delivering = true;
+        private volatile boolean recording;
 
         void deliver(boolean enabled) {
             delivering = enabled;
         }
 
+        void record(boolean enabled) {
+            recording = enabled;
+        }
+
+        String lastPublished() {
+            return published.get(published.size() - 1);
+        }
+
+        void replay(String message) {
+            for (PubSubHandler.MessageHandler handler : handlers) handler.onMessage(message);
+        }
+
         PubSubHandler handler() {
             return new PubSubHandler() {
                 @Override public void publish(String message) {
+                    if (recording) published.add(message);
                     if (!delivering) return;
                     for (MessageHandler handler : handlers) handler.onMessage(message);
                 }
@@ -173,6 +188,38 @@ class DistributedConvergenceTest {
             writer.flush(player);
 
             assertEquals(Optional.empty(), reader.getLinkKey(player, COOP));
+        } finally {
+            writer.shutdown();
+            reader.shutdown();
+        }
+    }
+
+    @Test
+    void aReplayedEventCannotRevertAnEntityThisNodeIsStillServing() {
+        DataAPI writer = node(true);
+        DataAPI reader = node(true);
+        UUID player = UUID.randomUUID();
+        try {
+            reader.subscribe(COINS, (id, oldValue, newValue) -> {});
+            reader.load(player);
+
+            channel.record(true);
+            writer.set(player, COINS, 10);
+            String olderEvent = channel.lastPublished();
+            writer.set(player, COINS, 20);
+            channel.record(false);
+            assertEquals(20, reader.get(player, COINS));
+
+            // Enough traffic about entities this node has never heard of to overrun any cap on the
+            // ordering state. The player is loaded here and being served right now, so their entry
+            // is the one thing that must not be dropped to make room.
+            for (int i = 0; i < 6_000; i++) {
+                writer.set(UUID.randomUUID(), COINS, i);
+            }
+
+            channel.replay(olderEvent);
+            assertEquals(20, reader.get(player, COINS),
+                    "a replayed older event reverted a player this node is serving");
         } finally {
             writer.shutdown();
             reader.shutdown();

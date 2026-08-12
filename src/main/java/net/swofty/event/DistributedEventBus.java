@@ -21,15 +21,18 @@ public class DistributedEventBus extends EventBus {
     private static final Gson GSON = new GsonBuilder().create();
     private static final Type MAP_TYPE = new TypeToken<Map<String, Object>>() {}.getType();
     private static final String SNAPSHOT_STREAM = "snapshot";
+    private static final String PLAYER_PREFIX = "player:";
+    private static final String LINKED_PREFIX = "linked:";
 
     private final PubSubHandler pubSubHandler;
     private final String nodeId;
     private final JsonFormat serializationFormat = new JsonFormat();
 
-    // How many entities' ordering state to keep. Dropping the least recently touched entity only
-    // costs the ordering guarantee for it, which is exactly the entity nobody on this node has
-    // heard about in a long time; keeping every entity the whole cluster ever wrote is a leak.
-    private static final int MAX_TRACKED_ENTITIES = 4096;
+    // How many entities' ordering state to keep for entities this node does NOT cache. Keeping one
+    // entry for every entity the whole cluster ever writes is a leak, but the cap must never reach
+    // an entity that is loaded here: dropping its state makes the node accept a replayed older
+    // event and revert live data, which the next local write then makes durable.
+    private static final int MAX_UNCACHED_TRACKED_ENTITIES = 4096;
 
     private final ConcurrentHashMap<String, DataField<?>> fieldRegistry = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, LinkType<?>> linkTypeRegistry = new ConcurrentHashMap<>();
@@ -37,13 +40,7 @@ public class DistributedEventBus extends EventBus {
     // entity -> stream -> highest version seen. Field events are ordered per field, not per
     // document: one transaction stamps every field it wrote with the same document version, and a
     // per-document guard would drop all but the first of them.
-    private final Map<String, Map<String, Long>> sequences = Collections.synchronizedMap(
-            new LinkedHashMap<>(64, 0.75f, true) {
-                @Override
-                protected boolean removeEldestEntry(Map.Entry<String, Map<String, Long>> eldest) {
-                    return size() > MAX_TRACKED_ENTITIES;
-                }
-            });
+    private final LinkedHashMap<String, Map<String, Long>> sequences = new LinkedHashMap<>(64, 0.75f, true);
 
     private volatile RemoteChangeHandler remoteChangeHandler;
 
@@ -318,6 +315,7 @@ public class DistributedEventBus extends EventBus {
             Long previous = streams.get(stream);
             if (previous != null && version <= previous) return true;
             streams.put(stream, version);
+            evictUncachedEntities();
             return false;
         }
     }
@@ -326,25 +324,61 @@ public class DistributedEventBus extends EventBus {
         if (version <= 0) return;
         synchronized (sequences) {
             sequences.computeIfAbsent(entity, ignored -> new HashMap<>()).merge(stream, version, Math::max);
+            evictUncachedEntities();
         }
+    }
+
+    // Walks from the least recently touched entity, skipping the ones this node caches. Those are
+    // pinned for as long as they are loaded, so the map can exceed the cap - by the number of
+    // entities this node is actually serving, which is bounded by the node itself.
+    private void evictUncachedEntities() {
+        if (sequences.size() <= MAX_UNCACHED_TRACKED_ENTITIES) return;
+        Iterator<Map.Entry<String, Map<String, Long>>> entities = sequences.entrySet().iterator();
+        while (sequences.size() > MAX_UNCACHED_TRACKED_ENTITIES && entities.hasNext()) {
+            if (cachedHere(entities.next().getKey())) continue;
+            entities.remove();
+        }
+    }
+
+    private boolean cachedHere(String entity) {
+        RemoteChangeHandler handler = remoteChangeHandler;
+        if (handler == null) return false;
+        if (entity.startsWith(PLAYER_PREFIX)) {
+            try {
+                return handler.isPlayerCached(UUID.fromString(entity.substring(PLAYER_PREFIX.length())));
+            } catch (IllegalArgumentException notAPlayerId) {
+                return false;
+            }
+        }
+        if (entity.startsWith(LINKED_PREFIX)) {
+            String rest = entity.substring(LINKED_PREFIX.length());
+            int colon = rest.indexOf(':');
+            if (colon < 0) return false;
+            return handler.isLinkedCached(rest.substring(0, colon), rest.substring(colon + 1));
+        }
+        return false;
     }
 
     @Override
     public void forgetPlayer(UUID player) {
-        sequences.remove(playerEntity(player));
+        synchronized (sequences) {
+            sequences.remove(playerEntity(player));
+        }
     }
 
     @Override
     public void forgetLinked(String linkTypeName, Object linkKey) {
-        sequences.remove(linkedEntity(linkTypeName, linkKey));
+        synchronized (sequences) {
+            sequences.remove(linkedEntity(linkTypeName, linkKey));
+        }
     }
 
     private static String playerEntity(UUID player) {
-        return "player:" + player;
+        return PLAYER_PREFIX + player;
     }
 
     private static String linkedEntity(String linkTypeName, Object linkKey) {
-        return "linked:" + linkTypeName + ":" + linkKey;
+        return LINKED_PREFIX + linkTypeName + ":" + linkKey;
     }
 
     private static String linkStream(String linkTypeName) {
@@ -352,7 +386,9 @@ public class DistributedEventBus extends EventBus {
     }
 
     int trackedEntities() {
-        return sequences.size();
+        synchronized (sequences) {
+            return sequences.size();
+        }
     }
 
     @SuppressWarnings("unchecked")
