@@ -460,6 +460,13 @@ try (var handle = api.lock("coop-transfer:" + coopId, Duration.ofSeconds(5))) {
 The Redis implementation uses `SET NX PX` with a compare-and-delete release, so a lock is only
 released by its owner and a lease bounds a crashed holder.
 
+A lock alone does not prevent a lost update: it serialises writers, but a node could still take it
+and then compute its new value from a cached copy a peer had already overwritten. So with a
+`DistributedLock` configured, a transaction rereads the entity from storage once it holds the lock,
+and the body sees what is really stored -- even if the pub/sub message announcing the peer's change
+has not arrived yet, or there is no pub/sub at all. Deferred writes are flushed before that reread,
+so nothing buffered is lost.
+
 ## Indexed Leaderboards
 
 Leaderboards are index-backed and **self-registering — no setup for numeric fields**. The first time

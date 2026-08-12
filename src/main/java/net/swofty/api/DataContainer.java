@@ -87,6 +87,22 @@ class DataContainer {
         ensureField(field, format);
     }
 
+    /**
+     * Replaces the whole cached view with a document just read from storage. Unlike
+     * {@link #loadDocument(DataFormat, byte[])} this also discards the materialised fields, so a
+     * value another node wrote is decoded afresh instead of being served from this node's copy.
+     *
+     * <p>The cached view is dropped, not merged: callers must hold the entity's exclusive lock and
+     * must have flushed pending writes first, or those writes are lost.
+     */
+    public void reload(byte[] raw) {
+        data.clear();
+        tombstones.clear();
+        this.backingDocument = raw;
+        this.documentLoaded = true;
+        this.dirty = false;
+    }
+
     /** Merges the touched fields over the backing document so nothing untouched is lost. */
     public byte[] serialize(DataFormat format) {
         Map<String, Object> merged = new LinkedHashMap<>();

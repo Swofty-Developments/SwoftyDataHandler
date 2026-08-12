@@ -45,9 +45,25 @@ class TransactionManager {
         return distributedLock == null ? NO_OP : distributedLock.acquire(key, lockTimeout);
     }
 
+    // The lock only serialises writers; it does not make this node's cached view fresh. A peer's
+    // change may not have arrived yet, or may never arrive when no pub/sub is configured, and a
+    // transaction reading that view would compute its new value from an already overwritten one.
+    // Holding the exclusive lock, reread the entity so the body decodes what is really in storage.
+    // With no distributed lock there is a single writer, whose own cache is already the truth.
+    private void refreshPlayer(UUID player) {
+        if (distributedLock == null) return;
+        playerData.refresh(player);
+    }
+
+    private void refreshLinked(String linkTypeName, Object key) {
+        if (distributedLock == null) return;
+        linkedData.refresh(linkTypeName, key);
+    }
+
     public <R> R execute(UUID player, TransactionFunction<R> action) {
         try (DistributedLock.Handle ignored = acquire("player:" + player)) {
             synchronized (playerData.getLock(player)) {
+                refreshPlayer(player);
                 TransactionContext tx = new TransactionContext(player, null, null);
                 try {
                     R result = action.apply(tx);
@@ -67,6 +83,7 @@ class TransactionManager {
     public void execute(UUID player, TransactionConsumer action) {
         try (DistributedLock.Handle ignored = acquire("player:" + player)) {
             synchronized (playerData.getLock(player)) {
+                refreshPlayer(player);
                 TransactionContext tx = new TransactionContext(player, null, null);
                 try {
                     action.accept(tx);
@@ -85,6 +102,7 @@ class TransactionManager {
         String ck = LinkedDataManager.compositeKey(type.name(), key);
         try (DistributedLock.Handle ignored = acquire("linked:" + ck)) {
             synchronized (linkedData.getLock(ck)) {
+                refreshLinked(type.name(), key);
                 TransactionContext tx = new TransactionContext(null, type, key);
                 try {
                     R result = action.apply(tx);

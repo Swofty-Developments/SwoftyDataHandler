@@ -225,6 +225,23 @@ class PlayerDataManager {
         return new HashSet<>(cache.keySet());
     }
 
+    /**
+     * Rereads a player's document from storage, discarding this node's materialised fields. Only
+     * for a caller holding the entity's exclusive (cross-node) lock: pending local writes are
+     * flushed first so nothing buffered is lost, and the reread then picks up whatever another
+     * node wrote since this node last looked. A player not cached here needs nothing.
+     */
+    void refresh(UUID player) {
+        synchronized (getLock(player)) {
+            DataContainer container = cache.get(player);
+            if (container == null) return;
+            if (container.isDirty()) {
+                persist(player);
+            }
+            container.reload(storage.load("players", player.toString()));
+        }
+    }
+
     /** Flushes every cached player. Used on shutdown so deferred writes are not lost. */
     public void flushAll() {
         for (UUID player : cache.keySet()) {

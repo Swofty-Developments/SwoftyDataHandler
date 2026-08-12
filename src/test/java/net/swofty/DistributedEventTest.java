@@ -2,8 +2,11 @@ package net.swofty;
 
 import net.swofty.api.DataAPIImpl;
 import net.swofty.codec.Codecs;
+import net.swofty.data.format.JsonFormat;
 import net.swofty.event.LinkChangeListener;
 import net.swofty.event.PubSubHandler;
+import net.swofty.lock.DistributedLock;
+import net.swofty.lock.InMemoryDistributedLock;
 import net.swofty.storage.InMemoryDataStorage;
 
 import org.junit.jupiter.api.*;
@@ -23,14 +26,21 @@ import static org.junit.jupiter.api.Assertions.*;
 class DistributedEventTest {
 
     // Hands every published message straight to every subscriber, this node included — the
-    // event bus is what filters its own messages out by node id.
+    // event bus is what filters its own messages out by node id. Delivery can be stopped to
+    // model a node that has not heard about a peer's change (yet, or ever).
     private static final class LoopbackChannel {
         private final List<PubSubHandler.MessageHandler> handlers = new CopyOnWriteArrayList<>();
+        private volatile boolean delivering = true;
+
+        void dropMessages() {
+            delivering = false;
+        }
 
         PubSubHandler handler() {
             return new PubSubHandler() {
                 @Override
                 public void publish(String message) {
+                    if (!delivering) return;
                     for (MessageHandler handler : handlers) {
                         handler.onMessage(message);
                     }
@@ -58,13 +68,16 @@ class DistributedEventTest {
             LinkedField.create("dist", "bank", Codecs.LONG, 0L, ISLAND);
 
     private InMemoryDataStorage storage;
+    private LoopbackChannel channel;
+    private DistributedLock lock;
     private DataAPIImpl nodeA;
     private DataAPIImpl nodeB;
 
     @BeforeEach
     void setUp() {
         storage = new InMemoryDataStorage();
-        LoopbackChannel channel = new LoopbackChannel();
+        channel = new LoopbackChannel();
+        lock = new InMemoryDistributedLock();
         nodeA = new DataAPIImpl(storage, channel.handler());
         nodeB = new DataAPIImpl(storage, channel.handler());
     }
@@ -77,6 +90,11 @@ class DistributedEventTest {
 
     private DataAPIImpl freshNode() {
         return new DataAPIImpl(storage);
+    }
+
+    // A node sharing the one cross-node lock; pass null to cut it off from pub/sub entirely.
+    private DataAPIImpl lockedNode(PubSubHandler pubSub) {
+        return new DataAPIImpl(storage, new JsonFormat(), pubSub, true, lock);
     }
 
     @Test
@@ -237,6 +255,116 @@ class DistributedEventTest {
         } finally {
             reread.shutdown();
         }
+    }
+
+    @Test
+    void transactionDirectReadsPastAStaleCache() {
+        UUID islandId = UUID.randomUUID();
+        DataAPIImpl a = lockedNode(channel.handler());
+        DataAPIImpl b = lockedNode(channel.handler());
+        try {
+            a.setDirect(islandId, ISLAND_BANK, 1000L);
+            b.loadLink(ISLAND, islandId);
+            assertEquals(1000L, b.getDirect(islandId, ISLAND_BANK));
+
+            // B never hears about the next write, so its cached 1000 is now stale.
+            channel.dropMessages();
+            a.setDirect(islandId, ISLAND_BANK, 7000L);
+
+            Long seenInsideTransaction = b.transactionDirect(islandId, ISLAND, tx -> {
+                long bank = tx.get(ISLAND_BANK);
+                tx.set(ISLAND_BANK, bank + 1L);
+                return bank;
+            });
+
+            assertEquals(7000L, seenInsideTransaction);
+
+            DataAPIImpl fresh = freshNode();
+            try {
+                assertEquals(7001L, fresh.getDirect(islandId, ISLAND_BANK));
+            } finally {
+                fresh.shutdown();
+            }
+        } finally {
+            a.shutdown();
+            b.shutdown();
+        }
+    }
+
+    @Test
+    void playerTransactionReadsPastAStaleCache() {
+        UUID player = UUID.randomUUID();
+        DataAPIImpl a = lockedNode(channel.handler());
+        DataAPIImpl b = lockedNode(channel.handler());
+        try {
+            a.set(player, COINS, 100);
+            b.load(player);
+            assertEquals(100, b.get(player, COINS));
+
+            channel.dropMessages();
+            a.set(player, COINS, 900);
+
+            Integer seenInsideTransaction = b.transaction(player, tx -> {
+                int coins = tx.get(COINS);
+                tx.set(COINS, coins + 1);
+                return coins;
+            });
+
+            assertEquals(900, seenInsideTransaction);
+
+            DataAPIImpl fresh = freshNode();
+            try {
+                assertEquals(901, fresh.get(player, COINS));
+            } finally {
+                fresh.shutdown();
+            }
+        } finally {
+            a.shutdown();
+            b.shutdown();
+        }
+    }
+
+    @Test
+    void concurrentDirectTransactionsDoNotLoseUpdates() throws InterruptedException {
+        int rounds = 100;
+        UUID islandId = UUID.randomUUID();
+        // No pub/sub at all: the cross-node lock and the refresh it enables are the only things
+        // keeping the two nodes from overwriting each other's increments.
+        DataAPIImpl a = lockedNode(null);
+        DataAPIImpl b = lockedNode(null);
+        try {
+            a.setDirect(islandId, ISLAND_BANK, 0L);
+
+            Thread first = incrementing(a, islandId, rounds);
+            Thread second = incrementing(b, islandId, rounds);
+            first.start();
+            second.start();
+            first.join(30_000);
+            second.join(30_000);
+            assertFalse(first.isAlive(), "increment thread did not finish");
+            assertFalse(second.isAlive(), "increment thread did not finish");
+
+            DataAPIImpl fresh = freshNode();
+            try {
+                assertEquals(2L * rounds, fresh.getDirect(islandId, ISLAND_BANK));
+            } finally {
+                fresh.shutdown();
+            }
+        } finally {
+            a.shutdown();
+            b.shutdown();
+        }
+    }
+
+    private Thread incrementing(DataAPIImpl node, UUID islandId, int rounds) {
+        return new Thread(() -> {
+            for (int i = 0; i < rounds; i++) {
+                node.transactionDirect(islandId, ISLAND, tx -> {
+                    tx.set(ISLAND_BANK, tx.get(ISLAND_BANK) + 1L);
+                    return null;
+                });
+            }
+        });
     }
 
     @Test

@@ -185,6 +185,24 @@ class LinkedDataManager {
         return cache.containsKey(compositeKey(linkTypeName, key));
     }
 
+    /**
+     * Rereads a shared entity from storage, discarding this node's materialised fields. Only for a
+     * caller holding the entity's exclusive (cross-node) lock: pending local writes are flushed
+     * first so nothing buffered is lost, and the reread then picks up whatever another node wrote
+     * since this node last looked. An entity not cached here needs nothing.
+     */
+    void refresh(String linkTypeName, Object key) {
+        String ck = compositeKey(linkTypeName, key);
+        synchronized (getLock(ck)) {
+            DataContainer container = cache.get(ck);
+            if (container == null) return;
+            if (container.isDirty()) {
+                persistLinked(linkTypeName, key, container);
+            }
+            container.reload(storage.load("linked/" + linkTypeName, key.toString()));
+        }
+    }
+
     /** Flushes every cached shared entity. Used on shutdown so deferred writes are not lost. */
     public void flushAll() {
         for (String ck : cache.keySet()) {
