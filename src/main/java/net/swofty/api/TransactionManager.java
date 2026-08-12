@@ -44,7 +44,7 @@ class TransactionManager {
     public <R> R execute(UUID player, TransactionFunction<R> action) {
         try (DistributedLock.Handle ignored = acquire("player:" + player)) {
             synchronized (playerData.getLock(player)) {
-                TransactionContext tx = new TransactionContext(player);
+                TransactionContext tx = new TransactionContext(player, null, null);
                 try {
                     R result = action.apply(tx);
                     tx.commit();
@@ -63,7 +63,7 @@ class TransactionManager {
     public void execute(UUID player, TransactionConsumer action) {
         try (DistributedLock.Handle ignored = acquire("player:" + player)) {
             synchronized (playerData.getLock(player)) {
-                TransactionContext tx = new TransactionContext(player);
+                TransactionContext tx = new TransactionContext(player, null, null);
                 try {
                     action.accept(tx);
                     tx.commit();
@@ -81,7 +81,7 @@ class TransactionManager {
         String ck = LinkedDataManager.compositeKey(type.name(), key);
         try (DistributedLock.Handle ignored = acquire("linked:" + ck)) {
             synchronized (linkedData.getLock(ck)) {
-                TransactionContext tx = new TransactionContext(null);
+                TransactionContext tx = new TransactionContext(null, type, key);
                 try {
                     R result = action.apply(tx);
                     tx.commit();
@@ -98,7 +98,11 @@ class TransactionManager {
     }
 
     private class TransactionContext implements Transaction {
+        // Either a player transaction (player set) or a direct one bound to a single link key
+        // (boundType/boundKey set), which is what lets a direct transaction operate without a player.
         private final UUID player;
+        private final LinkType<?> boundType;
+        private final Object boundKey;
         private final Map<String, Object> originalPlayerValues = new HashMap<>();
         private final Map<String, Object> newPlayerValues = new HashMap<>();
         private final Map<String, Object> originalLinkedValues = new HashMap<>();
@@ -106,13 +110,16 @@ class TransactionManager {
         private boolean committed = false;
         private boolean rolledBack = false;
 
-        TransactionContext(UUID player) {
+        TransactionContext(UUID player, LinkType<?> boundType, Object boundKey) {
             this.player = player;
+            this.boundType = boundType;
+            this.boundKey = boundKey;
         }
 
         @Override
         @SuppressWarnings("unchecked")
         public <T> T get(PlayerField<T> field) {
+            requirePlayer();
             if (newPlayerValues.containsKey(field.fullKey())) {
                 return (T) newPlayerValues.get(field.fullKey());
             }
@@ -123,6 +130,7 @@ class TransactionManager {
 
         @Override
         public <T> void set(PlayerField<T> field, T value) {
+            requirePlayer();
             Validation.validate(field, value);
             if (!originalPlayerValues.containsKey(field.fullKey())) {
                 originalPlayerValues.put(field.fullKey(), playerData.getFieldValue(player, field));
@@ -139,11 +147,11 @@ class TransactionManager {
         @Override
         @SuppressWarnings("unchecked")
         public <K, T> T get(LinkedField<K, T> field) {
-            String linkedKey = field.linkType().name() + ":" + field.fullKey();
+            String linkedKey = linkedKey(field);
             if (newLinkedValues.containsKey(linkedKey)) {
                 return (T) newLinkedValues.get(linkedKey);
             }
-            K linkKey = linkRegistry.resolve(player, field.linkType());
+            K linkKey = resolveLink(field.linkType());
             if (linkKey == null) return field.defaultValue();
             T value = linkedData.getFieldValue(field.linkType().name(), linkKey, field);
             originalLinkedValues.putIfAbsent(linkedKey, value);
@@ -153,12 +161,13 @@ class TransactionManager {
         @Override
         public <K, T> void set(LinkedField<K, T> field, T value) {
             Validation.validate(field, value);
-            String linkedKey = field.linkType().name() + ":" + field.fullKey();
+            String linkedKey = linkedKey(field);
+            K linkKey = resolveLink(field.linkType());
+            if (linkKey == null) {
+                throw new IllegalStateException(unresolvedLink(field.linkType()));
+            }
             if (!originalLinkedValues.containsKey(linkedKey)) {
-                K linkKey = linkRegistry.resolve(player, field.linkType());
-                if (linkKey != null) {
-                    originalLinkedValues.put(linkedKey, linkedData.getFieldValue(field.linkType().name(), linkKey, field));
-                }
+                originalLinkedValues.put(linkedKey, linkedData.getFieldValue(field.linkType().name(), linkKey, field));
             }
             newLinkedValues.put(linkedKey, value);
         }
@@ -174,16 +183,50 @@ class TransactionManager {
             throw new TransactionAbortException();
         }
 
+        private String linkedKey(LinkedField<?, ?> field) {
+            return field.linkType().name() + ":" + field.fullKey();
+        }
+
+        // A direct transaction already knows its key; a player transaction looks it up.
+        @SuppressWarnings("unchecked")
+        private <K> K resolveLink(LinkType<K> type) {
+            if (boundType != null) {
+                return boundType.name().equals(type.name()) ? (K) boundKey : null;
+            }
+            return player == null ? null : linkRegistry.resolve(player, type);
+        }
+
+        private Object resolveLink(String linkTypeName) {
+            if (boundType != null) {
+                return boundType.name().equals(linkTypeName) ? boundKey : null;
+            }
+            return player == null ? null : linkRegistry.resolve(player, linkTypeName);
+        }
+
+        private void requirePlayer() {
+            if (player == null) {
+                throw new IllegalStateException("Player fields are not available inside a direct transaction;"
+                        + " use transaction(player, ...) for player data");
+            }
+        }
+
+        private String unresolvedLink(LinkType<?> type) {
+            if (boundType != null) {
+                return "Transaction is bound to link type " + boundType.name() + ", not " + type.name();
+            }
+            return "Player " + player + " is not linked to " + type.name();
+        }
+
         void commit() {
             if (committed || rolledBack) return;
             committed = true;
 
             // Apply player field changes
-            DataContainer playerContainer = playerData.getContainer(player);
-            for (Map.Entry<String, Object> entry : newPlayerValues.entrySet()) {
-                playerContainer.rawData().put(entry.getKey(), entry.getValue());
-            }
             if (!newPlayerValues.isEmpty()) {
+                DataContainer playerContainer = playerData.getContainer(player);
+                for (Map.Entry<String, Object> entry : newPlayerValues.entrySet()) {
+                    playerContainer.rawData().put(entry.getKey(), entry.getValue());
+                }
                 playerData.persist(player);
             }
 
@@ -193,14 +236,11 @@ class TransactionManager {
                 int colonIdx = lk.indexOf(':');
                 String linkTypeName = lk.substring(0, colonIdx);
                 String fieldFullKey = lk.substring(colonIdx + 1);
-                Object newValue = entry.getValue();
 
-                Object linkKey = linkRegistry.resolve(player, linkTypeName);
+                Object linkKey = resolveLink(linkTypeName);
                 if (linkKey != null) {
-                    String ck = LinkedDataManager.compositeKey(linkTypeName, linkKey);
-                    // Use setFieldValue to persist
                     linkedData.setFieldValue(linkTypeName, linkKey,
-                            new SimpleFieldRef(fieldFullKey), newValue);
+                            new SimpleFieldRef(fieldFullKey), entry.getValue());
                 }
             }
         }
