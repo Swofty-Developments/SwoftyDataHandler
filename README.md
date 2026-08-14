@@ -516,6 +516,11 @@ api.loadLink(ISLAND, islandId);
 api.unloadLink(ISLAND, islandId);
 ```
 
+This is the primitive a proxy uses to implement "load the player's data on the target server
+*before* moving them there": the proxy asks the destination to `load(player)`, waits for the
+ack, then connects the player. Because the origin calls `unload(player)` on disconnect, the
+destination always starts from fresh storage.
+
 **Deleting a shared entity.** Unlinking the last member does not delete the entity — members come
 and go, and the document is shared state that outlives them — so an island or coop that is actually
 disbanded has to be ended explicitly, or its document stays in storage forever:
@@ -529,10 +534,29 @@ key on their own documents and firing the usual unlink events), drops any expira
 against it, and tells every other node to unlink its players and evict its cached copy. Afterwards
 `getDirect` on that key reads the fields' defaults.
 
-This is the primitive a proxy uses to implement "load the player's data on the target server
-*before* moving them there": the proxy asks the destination to `load(player)`, waits for the
-ack, then connects the player. Because the origin calls `unload(player)` on disconnect, the
-destination always starts from fresh storage.
+**Deleting a player.** The same thing for a player-scoped document — what a GDPR erasure or a staff
+"wipe me" command needs, and the only way to purge a player without knowing every field their
+document holds:
+
+```java
+api.deletePlayer(player);
+```
+
+That removes the player's document from storage, evicts the cached container (buffered writes
+included, so nothing can flush the document back afterwards), drops every expiration registered
+against them, removes them from every leaderboard the storage actually has an index for, and tells
+every other node to evict its cached copy. Afterwards each field reads its default, exactly as for a
+player who has never been seen.
+
+A deleted player who was still linked to a shared entity is **unlinked** from it, here and on every
+other node, and local link listeners are told as they would be for an `unlink`. That is not
+optional: the link key lived on the document being deleted, so the entity's member set would
+otherwise keep an id nothing can resolve. The shared entity itself is left completely alone —
+its document, its data and its remaining members all survive. Use `deleteLink` if ending the
+entity is what you mean.
+
+This is a hard delete with no undo. The library keeps no tombstone and no copy: if the caller
+wants the document back it has to have kept it.
 
 **Deferred persistence.** By default every write is flushed immediately. Pass `autoPersist = false`
 to buffer a whole play session in the cache and write it back once, on `flush`/`unload`
