@@ -3,6 +3,7 @@ package net.swofty.event;
 import net.swofty.DataField;
 import net.swofty.LinkType;
 
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
@@ -34,6 +35,14 @@ public interface RemoteChangeHandler {
      */
     default <K> Set<UUID> onLinkedDeleted(LinkType<K> type, K linkKey) {
         return Set.of();
+    }
+
+    /**
+     * A player's document was deleted on another node. Returns the links this node held for them,
+     * as link type to key, which the bus then reports to local link listeners.
+     */
+    default Map<LinkType<?>, Object> onPlayerDeleted(UUID player) {
+        return Map.of();
     }
 
     /**

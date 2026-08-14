@@ -262,4 +262,22 @@ class ExpiringFieldTest {
         assertEquals(Duration.ofHours(6), field.defaultTtl());
         assertEquals(island, field.linkType());
     }
+
+    @Test
+    void deletingAPlayerClearsTheirExpirations() {
+        UUID player = UUID.randomUUID();
+        UUID other = UUID.randomUUID();
+        api.set(player, DOUBLE_XP, true);
+        api.set(player, TEMP_TAG, "vip");
+        api.set(other, DOUBLE_XP, true);
+        assertFalse(api.isExpired(player, DOUBLE_XP));
+        assertTrue(api.getTimeRemaining(player, TEMP_TAG).isPresent());
+
+        api.deletePlayer(player);
+
+        assertTrue(api.isExpired(player, DOUBLE_XP), "no expiration outlives the player it was set on");
+        assertEquals(Optional.empty(), api.getTimeRemaining(player, TEMP_TAG));
+        assertFalse(api.get(player, DOUBLE_XP));
+        assertFalse(api.isExpired(other, DOUBLE_XP), "another player's expirations are untouched");
+    }
 }

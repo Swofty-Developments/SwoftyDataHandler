@@ -218,6 +218,20 @@ public class DistributedEventBus extends EventBus {
         publish(new EventMessage("LINK_DELETED", type.name(), nodeId, 0L, data));
     }
 
+    // A deletion is not an edit at some version, so it publishes unversioned and is delivered
+    // unconditionally: there is no later state of the document for it to be stale against, and a
+    // peer that dropped the event would keep serving a document that no longer exists. The cleared
+    // links travel no further than this node — every peer derives its own from its own registry,
+    // which is the only thing that knows what that peer had cached.
+    @Override
+    public void firePlayerDeleted(UUID player, Map<LinkType<?>, Object> clearedLinks) {
+        super.firePlayerDeleted(player, clearedLinks);
+        forgetPlayer(player);
+        Map<String, Object> data = payload();
+        put(data, "player", player.toString());
+        publish(new EventMessage("PLAYER_DELETED", "", nodeId, 0L, data));
+    }
+
     // A null-valued field is a legitimate state (an unset nullable field, a cleared link), so
     // payloads omit it rather than blowing up the write that triggered the event. The receiving
     // side reads a missing entry back as null.
@@ -257,6 +271,7 @@ public class DistributedEventBus extends EventBus {
             case "PLAYER_SNAPSHOT_SAVED" -> handlePlayerSnapshot(msg);
             case "LINKED_SNAPSHOT_SAVED" -> handleLinkedSnapshot(msg);
             case "LINK_DELETED" -> handleLinkDeleted(msg);
+            case "PLAYER_DELETED" -> handlePlayerDeleted(msg);
         }
     }
 
@@ -468,6 +483,16 @@ public class DistributedEventBus extends EventBus {
         for (UUID player : handler.onLinkedDeleted(type, linkKey)) {
             super.fireUnlinked(type, player, linkKey);
         }
+    }
+
+    private void handlePlayerDeleted(EventMessage msg) {
+        UUID player = UUID.fromString((String) msg.data.get("player"));
+        forgetPlayer(player);
+        RemoteChangeHandler handler = remoteChangeHandler;
+        if (handler == null) return;
+        // The handler clears this node's own link state and reports what it cleared, which is what
+        // local link listeners are then told about; there is no unlink message to wait for.
+        super.firePlayerDeleted(player, handler.onPlayerDeleted(player));
     }
 
     @SuppressWarnings("unchecked")

@@ -20,6 +20,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class LifecycleTest {
 
     private static final PlayerField<Integer> COINS = PlayerField.create("game", "coins", Codecs.INT, 0);
+    private static final PlayerField<String> NAME = PlayerField.create("game", "name", Codecs.STRING, "");
 
     @Test
     void unloadEvictsSoALaterReadIsNotStale() {
@@ -101,5 +102,72 @@ class LifecycleTest {
         DataAPIImpl observer = new DataAPIImpl(storage);
         assertEquals(13, observer.get(player, COINS));
         observer.shutdown();
+    }
+
+    @Test
+    void deletingAPlayerRemovesTheDocumentAndReadsFallBackToDefaults() {
+        DataStorage storage = new InMemoryDataStorage();
+        UUID player = UUID.randomUUID();
+
+        DataAPIImpl api = new DataAPIImpl(storage);
+        api.set(player, COINS, 900);
+        api.set(player, NAME, "swofty");
+        assertTrue(storage.exists("players", player.toString()));
+
+        api.deletePlayer(player);
+
+        assertFalse(storage.exists("players", player.toString()), "the document must be gone");
+        assertFalse(api.isLoaded(player), "nothing may stay cached for a deleted player");
+        assertEquals(0, api.get(player, COINS));
+        assertEquals("", api.get(player, NAME));
+
+        DataAPIImpl fresh = new DataAPIImpl(storage);
+        assertEquals(0, fresh.get(player, COINS), "and a node that reads them later sees nothing either");
+        fresh.shutdown();
+        api.shutdown();
+    }
+
+    @Test
+    void deletingAPlayerEvictsTheCacheSoNothingCanWriteTheDocumentBack() {
+        DataStorage storage = new InMemoryDataStorage();
+        UUID player = UUID.randomUUID();
+
+        DataAPIImpl node = new DataAPIImpl(storage, new JsonFormat(), null, /* autoPersist */ false);
+        node.set(player, COINS, 900);
+        node.flush(player);
+        node.set(player, NAME, "swofty"); // still buffered in the container
+
+        node.deletePlayer(player);
+
+        assertFalse(node.isLoaded(player), "the container goes, buffered write and all");
+        node.flush(player);
+        assertFalse(storage.exists("players", player.toString()),
+                "a cache that survived the delete would flush the old document straight back");
+
+        // A later write starts from nothing rather than merging over what was deleted.
+        node.set(player, COINS, 1);
+        node.flush(player);
+
+        DataAPIImpl observer = new DataAPIImpl(storage);
+        assertEquals(1, observer.get(player, COINS));
+        assertEquals("", observer.get(player, NAME), "the deleted fields do not ride back in on that write");
+        observer.shutdown();
+        node.shutdown();
+    }
+
+    @Test
+    void deletingAPlayerThatWasNeverSeenIsANoOp() {
+        DataStorage storage = new InMemoryDataStorage();
+        UUID known = UUID.randomUUID();
+        UUID stranger = UUID.randomUUID();
+
+        DataAPIImpl api = new DataAPIImpl(storage);
+        api.set(known, COINS, 5);
+
+        assertDoesNotThrow(() -> api.deletePlayer(stranger));
+
+        assertFalse(storage.exists("players", stranger.toString()));
+        assertEquals(5, api.get(known, COINS), "an unrelated player is untouched");
+        api.shutdown();
     }
 }

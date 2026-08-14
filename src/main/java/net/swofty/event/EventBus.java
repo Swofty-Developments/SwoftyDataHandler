@@ -86,8 +86,17 @@ public class EventBus {
         fireLinked(type, player, linkKey);
     }
 
-    @SuppressWarnings("unchecked")
     public <K> void fireUnlinked(LinkType<K> type, UUID player, K previousKey) {
+        unlinkedLocally(type, player, previousKey);
+    }
+
+    /**
+     * Reports an unlink to this node's listeners only. Separate from {@link #fireUnlinked} because
+     * the distributed bus publishes from that one, and a link cleared as part of an event that is
+     * already being published (or already came off the wire) must not be published a second time.
+     */
+    @SuppressWarnings("unchecked")
+    protected final <K> void unlinkedLocally(LinkType<K> type, UUID player, K previousKey) {
         List<LinkChangeListener<?>> listeners = linkChangeListeners.get(type.name());
         if (listeners != null) {
             for (LinkChangeListener<?> listener : listeners) {
@@ -130,6 +139,19 @@ public class EventBus {
 
     /** Signals that a shared entity's document was deleted outright. */
     public <K> void fireLinkDeleted(LinkType<K> type, K linkKey) {}
+
+    /**
+     * Signals that a player's document was deleted outright. {@code clearedLinks} maps each link
+     * type the player still had to the key it pointed at; those are reported to local link
+     * listeners exactly as an unlink would be, because from a listener's point of view that is
+     * what happened to the shared entity's membership.
+     */
+    @SuppressWarnings("unchecked")
+    public void firePlayerDeleted(UUID player, Map<LinkType<?>, Object> clearedLinks) {
+        for (Map.Entry<LinkType<?>, Object> cleared : clearedLinks.entrySet()) {
+            unlinkedLocally((LinkType<Object>) cleared.getKey(), player, cleared.getValue());
+        }
+    }
 
     /**
      * Records the version of a whole document this node has just read, so every event older than it

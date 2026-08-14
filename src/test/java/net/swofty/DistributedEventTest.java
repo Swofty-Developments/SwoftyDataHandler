@@ -392,4 +392,34 @@ class DistributedEventTest {
         nodeA.setDirect(islandId, ISLAND_LEVEL, 3);
         assertEquals(3, nodeB.get(player, ISLAND_LEVEL));
     }
+
+    @Test
+    void deletingAPlayerEvictsThemOnEveryNode() {
+        UUID player = UUID.randomUUID();
+        UUID islandId = UUID.randomUUID();
+        List<UUID> unlinkedOnPeer = new CopyOnWriteArrayList<>();
+
+        nodeB.subscribe(ISLAND, new LinkChangeListener<>() {
+            @Override
+            public void onLinked(UUID p, LinkType<UUID> type, UUID key) {}
+
+            @Override
+            public void onUnlinked(UUID p, LinkType<UUID> type, UUID previousKey) {
+                unlinkedOnPeer.add(p);
+            }
+        });
+
+        nodeA.link(player, ISLAND, islandId);
+        nodeA.set(player, COINS, 750);
+        nodeB.load(player);
+        assertTrue(nodeB.isLoaded(player));
+        assertEquals(750, nodeB.get(player, COINS));
+
+        nodeA.deletePlayer(player);
+
+        assertFalse(nodeB.isLoaded(player), "the peer must drop its cached container");
+        assertEquals(Optional.empty(), nodeB.getLinkKey(player, ISLAND), "and stop resolving their link");
+        assertEquals(List.of(player), unlinkedOnPeer);
+        assertEquals(0, nodeB.get(player, COINS), "a deleted player reads as their defaults everywhere");
+    }
 }

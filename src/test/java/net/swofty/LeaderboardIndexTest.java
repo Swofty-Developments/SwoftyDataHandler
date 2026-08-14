@@ -94,6 +94,39 @@ class LeaderboardIndexTest {
     }
 
     @Test
+    void deletingAPlayerTakesTheirRankWithThem() {
+        InMemoryDataStorage storage = new InMemoryDataStorage();
+        DataAPIImpl api = new DataAPIImpl(storage);
+        UUID a = UUID.randomUUID(), b = UUID.randomUUID(), c = UUID.randomUUID();
+        api.set(a, COINS, 300);
+        api.set(b, COINS, 100);
+        api.set(c, COINS, 200);
+        assertEquals(List.of(a, c, b), api.getTop(COINS, 3).stream().map(LeaderboardEntry::playerId).toList());
+
+        api.deletePlayer(a);
+
+        assertEquals(2L, storage.leaderboardSize(COINS.fullKey()),
+                "the deleted player is gone from the index, not just from the answers");
+        List<LeaderboardEntry<Integer>> top = api.getTop(COINS, 3);
+        assertEquals(List.of(c, b), top.stream().map(LeaderboardEntry::playerId).toList());
+        assertEquals(1, top.get(0).rank(), "and the survivors close the gap");
+        api.shutdown();
+    }
+
+    @Test
+    void deletingAPlayerDoesNotBuildAnIndexForAFieldNobodyRanks() {
+        InMemoryDataStorage storage = new InMemoryDataStorage();
+        DataAPIImpl api = new DataAPIImpl(storage);
+        UUID player = UUID.randomUUID();
+        api.set(player, COINS, 42);
+
+        api.deletePlayer(player);
+
+        assertFalse(storage.leaderboardExists(COINS.fullKey()), "nothing ranked this field, so there is no index");
+        api.shutdown();
+    }
+
+    @Test
     void storageWithoutAnIndexCannotRank() {
         DataAPIImpl api = new DataAPIImpl(new FileDataStorage(tempDir, new JsonFormat(), ".json"), new JsonFormat());
         assertThrows(IllegalStateException.class, () -> api.getTop(COINS, 10));

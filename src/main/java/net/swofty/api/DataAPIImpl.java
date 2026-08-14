@@ -143,6 +143,14 @@ public class DataAPIImpl implements DataAPI {
                     linkedData.evict(type.name(), linkKey);
                     return affected;
                 }
+
+                @Override
+                public Map<LinkType<?>, Object> onPlayerDeleted(UUID player) {
+                    Map<LinkType<?>, Object> cleared = linkRegistry.unlinkAll(player);
+                    expirationManager.clearPlayer(player);
+                    playerData.evict(player);
+                    return cleared;
+                }
             });
         }
     }
@@ -534,6 +542,17 @@ public class DataAPIImpl implements DataAPI {
         expirationManager.clearLinked(type.name(), key);
         linkedData.deleteLinked(type.name(), key);
         eventBus.fireLinkDeleted(type, key);
+    }
+
+    @Override
+    public void deletePlayer(UUID player) {
+        // Clear the links first, while the document that carries the keys is still there: a shared
+        // entity keeps its members in an in-memory reverse index, and a deleted player left in one
+        // is an id no later read can resolve. The shared documents themselves are untouched.
+        Map<LinkType<?>, Object> clearedLinks = linkRegistry.unlinkAll(player);
+        expirationManager.clearPlayer(player);
+        playerData.delete(player);
+        eventBus.firePlayerDeleted(player, clearedLinks);
     }
 
     @Override

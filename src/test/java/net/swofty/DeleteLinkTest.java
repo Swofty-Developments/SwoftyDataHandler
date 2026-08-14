@@ -113,6 +113,38 @@ class DeleteLinkTest {
     }
 
     @Test
+    void deletingAPlayerUnlinksThemAndLeavesTheSharedEntityAlone() {
+        UUID first = UUID.randomUUID();
+        UUID second = UUID.randomUUID();
+        UUID coop = UUID.randomUUID();
+        List<UUID> unlinkedOnPeer = new CopyOnWriteArrayList<>();
+        List<Set<UUID>> membersSeen = new CopyOnWriteArrayList<>();
+
+        nodeB.subscribe(COOP, new LinkChangeListener<UUID>() {
+            @Override public void onLinked(UUID player, LinkType<UUID> type, UUID key) {}
+            @Override public void onUnlinked(UUID player, LinkType<UUID> type, UUID key) { unlinkedOnPeer.add(player); }
+        });
+        nodeA.subscribe(BALANCE, (key, old, updated, members) -> membersSeen.add(Set.copyOf(members)));
+
+        nodeA.link(first, COOP, coop);
+        nodeA.link(second, COOP, coop);
+        nodeA.setDirect(coop, BALANCE, 250);
+
+        nodeA.deletePlayer(first);
+
+        assertTrue(storage.exists("linked/del_coop", coop.toString()), "the shared entity outlives its member");
+        assertEquals(250, nodeA.getDirect(coop, BALANCE), "and keeps its data");
+        assertEquals(Optional.empty(), nodeA.getLinkKey(first, COOP));
+        assertEquals(Optional.empty(), nodeB.getLinkKey(first, COOP), "the peer stops resolving the link too");
+        assertEquals(Optional.of(coop), nodeA.getLinkKey(second, COOP), "the surviving member keeps its link");
+        assertEquals(List.of(first), unlinkedOnPeer);
+
+        membersSeen.clear();
+        nodeA.setDirect(coop, BALANCE, 300);
+        assertEquals(List.of(Set.of(second)), membersSeen, "the deleted id is gone from the member set");
+    }
+
+    @Test
     void deletingALinkNobodyIsLinkedToStillRemovesTheDocument() {
         UUID coop = UUID.randomUUID();
         nodeA.setDirect(coop, BALANCE, 5);

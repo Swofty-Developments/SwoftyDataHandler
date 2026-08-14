@@ -117,6 +117,19 @@ public interface DataAPI extends AutoCloseable {
      */
     <K> void deleteLink(LinkType<K> type, K key);
 
+    /**
+     * Deletes a player outright: their document is removed from storage, the cached container,
+     * expirations and leaderboard ranks held for them are dropped, and every other node evicts its
+     * cached copy. A player still linked to a shared entity is unlinked from it — the link key
+     * lived on the document being deleted, so the entity's member set would otherwise keep an id
+     * nothing can resolve — but the shared entity itself is left alone; end one with
+     * {@link #deleteLink} if that is what you mean.
+     *
+     * <p>This is a hard delete with no undo: afterwards every field reads as its default, exactly
+     * as for a player who has never been seen. Deleting a player who does not exist does nothing.
+     */
+    void deletePlayer(UUID player);
+
     // Distributed locking - takes the configured DistributedLock for an app-level critical section
     // that spans more than one field or entity. Use with try-with-resources; requires a lock to
     // have been supplied to the implementation.

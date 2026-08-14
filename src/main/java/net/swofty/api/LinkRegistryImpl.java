@@ -55,6 +55,27 @@ class LinkRegistryImpl {
         return previousKey;
     }
 
+    /**
+     * Drops every link this node holds for a player, returning what was cleared as link type to
+     * key. Used when the player's own document is deleted: the link key lived on that document, so
+     * leaving the reverse index alone would keep a member id in a shared entity that nothing can
+     * resolve any more. Like {@link #unlink}, it works off what this node has cached — a node that
+     * never saw the link has nothing to clear, and nothing to report.
+     */
+    @SuppressWarnings("unchecked")
+    Map<LinkType<?>, Object> unlinkAll(UUID player) {
+        Map<LinkType<?>, Object> cleared = new LinkedHashMap<>();
+        for (LinkType<?> raw : knownTypes.values()) {
+            LinkType<Object> type = (LinkType<Object>) raw;
+            Object previousKey = unlink(player, type);
+            if (previousKey != null) {
+                cleared.put(type, previousKey);
+            }
+        }
+        playerLinks.remove(player);
+        return cleared;
+    }
+
     @SuppressWarnings("unchecked")
     public <K> K resolve(UUID player, LinkType<K> type) {
         knownTypes.putIfAbsent(type.name(), type);

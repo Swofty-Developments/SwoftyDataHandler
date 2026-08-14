@@ -307,6 +307,56 @@ class PlayerDataManager {
         return afterLoad(player, executor, () -> unload(player));
     }
 
+    /** Drops the cached view without persisting it, for a player whose document is gone. */
+    void evict(UUID player) {
+        synchronized (getLock(player)) {
+            cache.remove(player);
+        }
+        eventBus.forgetPlayer(player);
+    }
+
+    /**
+     * Deletes the player's document itself and forgets everything cached about it here, including
+     * the ranks they held. A load already in flight is waited out first, exactly as
+     * {@link #unload(UUID)} does: it would otherwise finish into the container this just dropped
+     * and leave the node serving a document that no longer exists.
+     */
+    void delete(UUID player) {
+        awaitLoad(player);
+        synchronized (getLock(player)) {
+            removeFromLeaderboards(player);
+            cache.remove(player);
+            storage.delete(TYPE, player.toString());
+        }
+        eventBus.forgetPlayer(player);
+    }
+
+    // Only boards the storage already has are touched, so purging a player never builds an index
+    // for a field nobody ranks. The keys come from the stored document as well as the cached view,
+    // because a field this node never materialised can still hold a rank from an earlier session.
+    private void removeFromLeaderboards(UUID player) {
+        LeaderboardIndex index = leaderboardIndex();
+        if (index == null) return;
+        for (String fullKey : documentKeys(player)) {
+            if (index.leaderboardExists(fullKey)) {
+                index.removeFromLeaderboard(fullKey, player.toString());
+            }
+        }
+    }
+
+    private Set<String> documentKeys(UUID player) {
+        Set<String> keys = new HashSet<>();
+        DataContainer container = cache.get(player);
+        if (container != null) {
+            keys.addAll(container.rawData().keySet());
+        }
+        byte[] stored = storage.load(TYPE, player.toString());
+        if (stored != null) {
+            keys.addAll(format.readRaw(stored).keySet());
+        }
+        return keys;
+    }
+
     private CompletableFuture<Void> afterLoad(UUID player, Executor executor, Runnable action) {
         CompletableFuture<Void> inFlight = loads.get(player);
         CompletableFuture<Void> before = inFlight == null ? CompletableFuture.completedFuture(null) : inFlight;

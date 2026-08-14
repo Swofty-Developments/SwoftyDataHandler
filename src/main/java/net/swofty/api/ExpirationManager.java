@@ -72,6 +72,12 @@ class ExpirationManager {
         return expiration == null || Instant.now().isAfter(expiration.expiry());
     }
 
+    /** Forgets every expiration registered against a player, e.g. when their document is deleted. */
+    public void clearPlayer(UUID player) {
+        String prefix = "player:" + player + ":";
+        expirations.keySet().removeIf(registered -> registered.startsWith(prefix));
+    }
+
     /** Forgets every expiration registered against a shared entity, e.g. when it is deleted. */
     public void clearLinked(String linkTypeName, Object key) {
         String prefix = "linked:" + linkTypeName + ":" + key + ":";
